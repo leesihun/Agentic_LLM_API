@@ -176,6 +176,28 @@ class ClusterStore:
             return task
         return None
 
+    def renew_lease(self, node_name: str, task_id: str) -> dict[str, Any] | None:
+        """Extend a running task's lease so a long execution isn't re-queued
+        (and duplicated on another node) while it is still in progress.
+
+        Only the current lease-holder may renew; a task that is terminal or has
+        already been re-leased to someone else is returned unchanged. The slave
+        calls this on an interval derived from the lease length, so a task can
+        run for as long as it needs without the lease expiring under it.
+        """
+        node_name = (node_name or "").strip()
+        now = _now()
+        expires = now + timedelta(seconds=config.CLUSTER_TASK_LEASE_SECONDS)
+        with FileLock(self._task_lock(task_id), timeout=10):
+            task = self._read_task_unlocked(task_id)
+            if not task:
+                raise FileNotFoundError(task_id)
+            if task.get("status") == "leased" and task.get("leased_by") == node_name:
+                task["leased_at"] = task.get("leased_at") or _iso(now)
+                task["lease_expires_at"] = _iso(expires)
+                self._write_task_unlocked(task)
+            return task
+
     def load_task(self, task_id: str) -> dict[str, Any] | None:
         with FileLock(self._task_lock(task_id), timeout=10):
             return self._read_task_unlocked(task_id)

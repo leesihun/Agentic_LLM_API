@@ -407,10 +407,11 @@ async def run_heartbeat_loop(send_fn: Callable[[int, str], Awaitable[None]]) -> 
             continue
 
         try:
-            await asyncio.wait_for(_run_once(send_fn), timeout=3600)
-        except asyncio.TimeoutError:
-            logger.error(
-                "[Heartbeat] Tick exceeded 3600s deadline — cancelling and continuing loop"
-            )
+            # No wall-clock deadline on a tick. A heartbeat may run long,
+            # tool-heavy tasks and must never be cut off mid-task — a cancelled
+            # tick would abandon the in-flight llm-api turn and waste the work.
+            # Liveness is instead provided by the LLM call itself (SSE keepalive
+            # pings + a finite connect timeout in the shared client).
+            await _run_once(send_fn)
         except Exception as exc:
             logger.error(f"[Heartbeat] Unhandled loop error: {exc}", exc_info=True)

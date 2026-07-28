@@ -7,6 +7,7 @@ import json
 import logging
 import shutil
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +71,36 @@ async def _task_event(client: httpx.AsyncClient, task_id: str, message: str, eve
         "type": event_type,
         "message": message,
     })
+
+
+def _lease_renew_interval(task: dict[str, Any]) -> float:
+    """Renew at half the lease duration (floor 30s). Deriving the interval from
+    the leased task keeps the slave correct even if the master changes
+    CLUSTER_TASK_LEASE_SECONDS; falls back to 300s if the timestamps are absent."""
+    try:
+        leased = datetime.fromisoformat(task["leased_at"])
+        expires = datetime.fromisoformat(task["lease_expires_at"])
+        duration = (expires - leased).total_seconds()
+        if duration > 0:
+            return max(30.0, duration / 2)
+    except (KeyError, TypeError, ValueError):
+        pass
+    return 300.0
+
+
+async def _renew_lease_loop(client: httpx.AsyncClient, task: dict[str, Any]) -> None:
+    """Keep a running task's lease fresh so the master never re-queues it (which
+    would duplicate execution) while it runs — however long that takes."""
+    task_id = task["task_id"]
+    interval = _lease_renew_interval(task)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await post_json(client, f"/api/cluster/tasks/{task_id}/renew", {
+                "node_name": config.NODE_NAME,
+            })
+        except Exception as exc:
+            logger.debug("[Cluster] Lease renew failed for %s: %s", task_id, exc)
 
 
 async def _complete(client: httpx.AsyncClient, task_id: str, result: str | None = None, error: str | None = None) -> None:
@@ -149,6 +180,7 @@ async def _execute_task(client: httpx.AsyncClient, task: dict[str, Any]) -> None
         "messages": json.dumps(messages),
         "session_id": f"cluster_{task_id}",
     }
+    renew = asyncio.create_task(_renew_lease_loop(client, task))
     try:
         result = await llm_api.chat(
             payload,
@@ -163,6 +195,11 @@ async def _execute_task(client: httpx.AsyncClient, task: dict[str, Any]) -> None
         logger.error("[Cluster] Task %s failed: %s", task_id, exc, exc_info=True)
         await _complete(client, task_id, error=f"{type(exc).__name__}: {exc}")
     finally:
+        renew.cancel()
+        try:
+            await renew
+        except asyncio.CancelledError:
+            pass
         shutil.rmtree(outbox, ignore_errors=True)
 
 

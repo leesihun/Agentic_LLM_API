@@ -333,18 +333,38 @@ async def chat_completions(
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         created_timestamp = int(time.time())
 
+        # Persist the user turn + whatever assistant text was produced, exactly
+        # once. Runs on normal completion AND on interruption (client
+        # disconnect, @stop, upstream error) so a long agentic turn is never
+        # lost from history — the next turn continues from here instead of
+        # restarting before this turn. Called synchronously from a finally: a
+        # create_task/to_thread scheduled during request/generator teardown may
+        # never get a chance to run.
+        _persist_state = {"done": False, "assistant": ""}
+
+        def _persist_turn():
+            if _persist_state["done"]:
+                return
+            _persist_state["done"] = True
+            to_store = list(new_history_messages)
+            if _persist_state["assistant"]:
+                to_store.append({"role": "assistant", "content": _persist_state["assistant"]})
+            if not to_store:
+                return
+            try:
+                conversation_store.append_messages(session_id, to_store)
+                db.increment_session_message_count(session_id, len(to_store))
+            except Exception:
+                pass
+
         if is_streaming:
             async def generate_stream():
                 try:
                     assistant_message = ""
-                    persisted_messages = [
-                        *new_history_messages,
-                        {"role": "assistant", "content": ""},
-                    ]
                     async for event in agent.run_stream(agent_messages, file_metadata):
                         if isinstance(event, TextEvent):
                             assistant_message += event.content
-                            persisted_messages[-1]["content"] = assistant_message
+                            _persist_state["assistant"] = assistant_message
                             chunk = ChatCompletionChunk(
                                 id=request_id,
                                 created=created_timestamp,
@@ -387,13 +407,6 @@ async def chat_completions(
                     yield {"data": final_chunk.model_dump_json()}
                     yield {"data": "[DONE]"}
 
-                    asyncio.create_task(asyncio.to_thread(
-                        conversation_store.append_messages, session_id, persisted_messages
-                    ))
-                    asyncio.create_task(asyncio.to_thread(
-                        db.increment_session_message_count, session_id, len(persisted_messages)
-                    ))
-
                 except Exception as e:
                     error_data = {
                         "error": {
@@ -402,34 +415,30 @@ async def chat_completions(
                         }
                     }
                     yield {"data": json.dumps(error_data)}
+                finally:
+                    # Fires on normal end, error, and client-disconnect
+                    # cancellation (generator aclose) alike.
+                    _persist_turn()
 
             return EventSourceResponse(generate_stream())
 
         else:
-            assistant_message = await agent.run(agent_messages, file_metadata)
-
-            persisted_messages = [
-                *new_history_messages,
-                {"role": "assistant", "content": assistant_message},
-            ]
-            asyncio.create_task(asyncio.to_thread(
-                conversation_store.append_messages, session_id, persisted_messages
-            ))
-            asyncio.create_task(asyncio.to_thread(
-                db.increment_session_message_count, session_id, len(persisted_messages)
-            ))
-
-            return ChatCompletionResponse(
-                id=request_id,
-                created=created_timestamp,
-                model=model_name,
-                choices=[
-                    ChatCompletionChoice(
-                        message=ChatMessage(role="assistant", content=assistant_message)
-                    )
-                ],
-                x_session_id=session_id,
-            )
+            try:
+                assistant_message = await agent.run(agent_messages, file_metadata)
+                _persist_state["assistant"] = assistant_message
+                return ChatCompletionResponse(
+                    id=request_id,
+                    created=created_timestamp,
+                    model=model_name,
+                    choices=[
+                        ChatCompletionChoice(
+                            message=ChatMessage(role="assistant", content=assistant_message)
+                        )
+                    ],
+                    x_session_id=session_id,
+                )
+            finally:
+                _persist_turn()
 
     except HTTPException:
         raise

@@ -176,7 +176,14 @@ class VllmBackend:
         pool_size = getattr(config, 'VLLM_CONNECTION_POOL_SIZE', 20)
         self._client = httpx.AsyncClient(
             verify=self._ssl_verify,
-            timeout=config.STREAM_TIMEOUT,
+            # read=None → long agentic turns and slow prefill are never cut off
+            # mid-stream; connect stays finite so a dead vLLM fails fast.
+            timeout=httpx.Timeout(
+                connect=getattr(config, "STREAM_CONNECT_TIMEOUT", 10.0),
+                read=getattr(config, "STREAM_READ_TIMEOUT", None),
+                write=60.0,
+                pool=60.0,
+            ),
             limits=httpx.Limits(
                 max_connections=pool_size,
                 max_keepalive_connections=pool_size // 2,

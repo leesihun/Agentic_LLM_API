@@ -148,8 +148,11 @@ HEARTBEAT_ACTIVE_END = getattr(_CLUSTER, "HEARTBEAT_ACTIVE_END", "23:59")
 # Debounce window for rapid messages (seconds). Messages within this window
 # are combined into one LLM call.
 DEBOUNCE_SECONDS = 1.5
-# LLM request timeout (seconds). Increase for tool-heavy calls.
-LLM_TIMEOUT_SECONDS = 3000
+# LLM request timeout (seconds). None = no read timeout, so long tool-heavy
+# turns and delegated cluster tasks are never cut off mid-run — the call falls
+# back to the shared client's read=None (see core/llm_api.get_client). The
+# client keeps a finite connect timeout, so a dead LLM API still fails fast.
+LLM_TIMEOUT_SECONDS = None
 # Max startup retry attempts for Messenger registration / webhook setup.
 STARTUP_RETRY_ATTEMPTS = 6
 # Base delay between startup retries (seconds, doubles each attempt).

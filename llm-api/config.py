@@ -416,7 +416,13 @@ ALLOWED_WRITE_DIRS: list[Path] = []  # empty = allow all absolute paths
 # ============================================================================
 # Streaming Settings
 # ============================================================================
-STREAM_TIMEOUT = 600
+# vLLM HTTP client timeouts. read=None → never time out waiting for the next
+# token, so long agentic turns and slow prefill on a near-full context window
+# are never cut off mid-stream. Connect stays finite so a dead vLLM backend
+# still fails fast (the backend also pre-checks /v1/models with a 3s timeout
+# before every stream, see VllmBackend._select_available_host).
+STREAM_CONNECT_TIMEOUT = 10.0
+STREAM_READ_TIMEOUT = None
 
 # ============================================================================
 # CORS Settings

@@ -21,11 +21,13 @@ def get_client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
         _client = httpx.AsyncClient(
-            # read=1800 (30 min per chunk) is generous enough for OpenCode startup
-            # and slow shell tools while still letting a truly stuck stream surface
-            # as ReadTimeout — read=None blocks the heartbeat loop forever when the
-            # llm-api server degrades after many requests.
-            timeout=httpx.Timeout(connect=10.0, read=1800.0, write=60.0, pool=60.0),
+            # read=None → never time out mid-stream, so long agentic turns and
+            # slow tools (OpenCode startup, multi-minute shell/code_exec, big
+            # RAG ingests) are never cut off. The llm-api SSE stream emits ~15s
+            # keepalive pings, which keep a healthy-but-slow stream flowing;
+            # connect stays finite so a genuinely dead llm-api server still
+            # fails fast instead of hanging the caller forever.
+            timeout=httpx.Timeout(connect=10.0, read=None, write=60.0, pool=60.0),
             trust_env=False,
             limits=httpx.Limits(
                 max_connections=10,

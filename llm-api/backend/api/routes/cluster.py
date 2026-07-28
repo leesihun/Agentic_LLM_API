@@ -100,6 +100,18 @@ async def lease_task(request: Request):
     return {"ok": True, "task": task}
 
 
+@router.post("/tasks/{task_id}/renew")
+async def renew_task_lease(task_id: str, request: Request):
+    _auth(request)
+    payload = await request.json()
+    node_name = str(payload.get("node_name") or "").strip()
+    try:
+        task = cluster_store.renew_lease(node_name, task_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"ok": True, "task": task}
+
+
 @router.get("/tasks/{task_id}")
 async def get_task(task_id: str, request: Request):
     _auth(request)

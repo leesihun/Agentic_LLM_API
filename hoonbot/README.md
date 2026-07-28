@@ -44,7 +44,7 @@ in `prompts/master/` and `prompts/slave/`.
 | `HEARTBEAT_ENABLED` | `True` | Proactive heartbeat task loop |
 | `HEARTBEAT_INTERVAL_SECONDS` | `3000` | Time between heartbeat ticks |
 | `DEBOUNCE_SECONDS` | `1.5` | Combine rapid messages in this window |
-| `LLM_TIMEOUT_SECONDS` | `3000` | LLM request timeout (increase for heavy tool use) |
+| `LLM_TIMEOUT_SECONDS` | `None` | LLM request read timeout; `None` = no timeout (long tool-heavy turns never cut off) |
 | `STREAMING_ENABLED` | `True` | Stream LLM responses with live tool status |
 | `SESSION_MAX_AGE_DAYS` | `1` | Sessions older than this reset |
 
