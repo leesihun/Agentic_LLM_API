@@ -148,6 +148,16 @@ flowchart LR
 - **🧠 Reasoning-model aware** — `<think>` chains from GLM / Qwen3-Thinking /
   DeepSeek-R1 are lifted into a separate reasoning channel (never leaked into
   the user's answer), with a defense-in-depth splitter as a backstop.
+- **🖼 Vision / multimodal** — attach images to a chat and, on a vision-capable
+  model, they're embedded as `image_url` parts (auto-resized to save tokens);
+  on a text-only model they gracefully degrade to metadata instead of garbage.
+- **🔁 Self-correcting** — anti-spiral detection breaks the agent out of
+  repeated identical tool calls, a reflection nudge fires after consecutive
+  failures, and auto-compaction summarizes-and-retries when a call overflows
+  the context window — long runs recover instead of crashing.
+- **🖥 Background processes** — `process_monitor` launches long-running
+  processes, tails their output incrementally, and kills them — the agent can
+  start a server or training run and check back on it later.
 - **🗜 Microcompaction** — old iterations are compressed and oversize tool
   outputs spill to disk, so long agent runs never blow the context window.
 - **📁 Per-session workspaces** — point the loop at a project root and every
@@ -170,6 +180,20 @@ curl -s http://<master-ip>:10002/v1/chat/completions \
 Key endpoints: `POST /v1/chat/completions` · `GET /v1/models` · `POST /login`
 · `POST /signup` · session history / compact / stop · async RAG uploads under
 `/jobs/*` · Swagger UI at `/docs`, ReDoc at `/redoc`.
+
+### Admin & operations
+
+- **🔐 JWT auth with signup** — password-hashed accounts, 7-day tokens, a
+  default admin, and per-user sessions persisted to disk.
+- **🔀 Runtime model switching** — an admin can hot-swap the served model
+  (`POST /model`) without restarting the service.
+- **🛑 Emergency stop** — a `stop-inference` control (and per-session stop) lets
+  an operator abort a runaway generation instantly.
+- **🎛 Fine sampling control** — temperature, top-p, top-k, min-p, and
+  repetition-penalty are all tunable, with per-model temperature overrides.
+- **🗂 Session persistence** — every conversation is a resumable `.jsonl` on
+  disk with a fast-startup recent-window cache; history, compaction, and stop
+  are all first-class endpoints.
 
 ---
 
@@ -241,10 +265,17 @@ flowchart TB
     class IO,MW,DB,WP,WH s;
 ```
 
-- **💬 Real-time chat** — rooms, direct messages, typing indicators, reactions,
-  pins, edits, and `@mentions` with autocomplete over Socket.IO.
-- **📎 File sharing** — drag-and-drop uploads, image previews, attachments the
-  bot can download and act on.
+- **💬 Real-time chat** — group & 1:1 rooms, typing indicators, online presence,
+  read receipts, and `@mentions` with autocomplete over Socket.IO.
+- **🔍 Full-featured messaging** — per-room **and** global message search, emoji
+  reactions, pinned messages, reply/quote with preview, edit/delete, and a
+  silent mode — the table-stakes of Slack/Teams, self-hosted.
+- **📎 File sharing** — drag-and-drop uploads (100 MB), clipboard image paste,
+  image previews, and attachments the bot can download and act on.
+- **🗄 Built-in file manager** — a shared storage browser (list, mkdir, upload,
+  download, delete, rename) — a feature Slack doesn't have.
+- **🔔 Desktop notifications** — native OS notifications for mentions and DMs, in
+  both the browser and the desktop app.
 - **⌨️ Embedded coding terminals** — full `claude` and `opencode` sessions
   streamed into the browser via WebSockets + `node-pty`, token-gated.
 - **🕸 Web watchers** — subscribe a room to a URL; the server polls, hashes, and
