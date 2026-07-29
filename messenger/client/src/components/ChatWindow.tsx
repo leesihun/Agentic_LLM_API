@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react';
 import { useSocket } from '../contexts/SocketContext';
 import axios from 'axios';
 import api, { getServerUrl, getUploadBaseUrl } from '../services/api';
@@ -40,42 +40,81 @@ export default function ChatWindow({ room, user, users, onlineUserIds, onLeaveRo
   const [uploadProgress, setUploadProgress] = useState<number | null>(null); // 0-100 or null
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [showAddMembers, setShowAddMembers] = useState(false);
+  const [loadedRoomId, setLoadedRoomId] = useState<number | null>(null);
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hasMoreRef = useRef(true);
   const loadingMoreRef = useRef(false);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const messagesContentRef = useRef<HTMLDivElement>(null);
   const dragCounterRef = useRef(0);
+  const activeRoomIdRef = useRef(room.id);
+  const historyRequestRef = useRef(0);
+  const stickToBottomRef = useRef(true);
+  const pendingPrependRef = useRef<{
+    roomId: number;
+    scrollTop: number;
+    scrollHeight: number;
+  } | null>(null);
+  const pendingCenteredMessageRef = useRef<{ roomId: number; messageId: number } | null>(null);
+  activeRoomIdRef.current = room.id;
 
   const scrollToBottom = useCallback(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const container = messagesContainerRef.current;
+    if (container) container.scrollTop = container.scrollHeight;
+  }, []);
+
+  const isNearBottom = useCallback(() => {
+    const container = messagesContainerRef.current;
+    if (!container) return true;
+    return container.scrollHeight - container.scrollTop - container.clientHeight <= 80;
+  }, []);
+
+  const centerMessageInContainer = useCallback((element: HTMLElement) => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+
+    const containerRect = container.getBoundingClientRect();
+    const elementRect = element.getBoundingClientRect();
+    container.scrollTop +=
+      elementRect.top - containerRect.top - (container.clientHeight - elementRect.height) / 2;
   }, []);
 
   // Fetch messages when room changes
   useEffect(() => {
     let cancelled = false;
+    const roomId = room.id;
+
+    activeRoomIdRef.current = roomId;
+    historyRequestRef.current += 1;
+    loadingMoreRef.current = false;
+    hasMoreRef.current = true;
+    stickToBottomRef.current = true;
+    pendingPrependRef.current = null;
+    pendingCenteredMessageRef.current = null;
+    setLoadedRoomId(null);
 
     async function fetchMessages() {
       setLoading(true);
       setMessages([]);
-      hasMoreRef.current = true;
       try {
-        const res = await api.get(`/rooms/${room.id}/messages?userId=${user.id}`);
-        if (!cancelled) {
+        const res = await api.get(`/rooms/${roomId}/messages?userId=${user.id}`);
+        if (!cancelled && activeRoomIdRef.current === roomId) {
           setMessages(res.data);
-          setTimeout(scrollToBottom, 100);
         }
       } catch (err) {
         console.error('Failed to fetch messages:', err);
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled && activeRoomIdRef.current === roomId) {
+          setLoadedRoomId(roomId);
+          setLoading(false);
+        }
       }
     }
 
     fetchMessages();
-    socket?.emit('join_room', room.id);
+    socket?.emit('join_room', roomId);
 
     // Clear stale typing indicators from previous room
     setTypingUsers(new Map());
@@ -94,47 +133,94 @@ export default function ChatWindow({ room, user, users, onlineUserIds, onLeaveRo
       }
     }).catch(() => {});
 
-    const prevRoomId = room.id;
     return () => {
       cancelled = true;
+      historyRequestRef.current += 1;
       // Stop typing and leave previous room on cleanup
-      socket?.emit('typing_stop', prevRoomId);
-      socket?.emit('leave_room', prevRoomId);
+      socket?.emit('typing_stop', roomId);
+      socket?.emit('leave_room', roomId);
     };
-  }, [room.id, user.id, socket, scrollToBottom]);
+  }, [room.id, user.id, socket]);
+
+  // Keep all automatic movement inside the message pane. A layout effect makes
+  // the first room render land at the bottom before paint, while preserving the
+  // exact visible position when older messages are prepended.
+  useLayoutEffect(() => {
+    const container = messagesContainerRef.current;
+    if (!container || loadedRoomId !== room.id || loading) return;
+
+    const pendingPrepend = pendingPrependRef.current;
+    if (pendingPrepend?.roomId === room.id) {
+      container.scrollTop =
+        pendingPrepend.scrollTop + (container.scrollHeight - pendingPrepend.scrollHeight);
+      pendingPrependRef.current = null;
+      return;
+    }
+
+    const pendingCenter = pendingCenteredMessageRef.current;
+    if (pendingCenter?.roomId === room.id) {
+      const element = document.getElementById(`msg-${pendingCenter.messageId}`);
+      if (element) centerMessageInContainer(element);
+      pendingCenteredMessageRef.current = null;
+      return;
+    }
+
+    if (stickToBottomRef.current) scrollToBottom();
+  }, [centerMessageInContainer, loadedRoomId, loading, messages, room.id, scrollToBottom]);
+
+  // Lazy-loaded images and rich message content can change height well after
+  // the messages request finishes. Stay pinned only when the user was already
+  // following the bottom; never pull a user back down while reading history.
+  useEffect(() => {
+    const content = messagesContentRef.current;
+    if (!content || loadedRoomId !== room.id || typeof ResizeObserver === 'undefined') return;
+
+    const observer = new ResizeObserver(() => {
+      if (activeRoomIdRef.current === room.id && stickToBottomRef.current) {
+        scrollToBottom();
+      }
+    });
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [loadedRoomId, room.id, scrollToBottom]);
 
   // Load more messages on scroll up
   const handleScroll = useCallback(async () => {
     const container = messagesContainerRef.current;
-    if (!container || container.scrollTop > 50 || !hasMoreRef.current || loadingMoreRef.current) return;
+    if (!container) return;
 
+    stickToBottomRef.current = isNearBottom();
+    if (container.scrollTop > 50 || !hasMoreRef.current || loadingMoreRef.current) return;
+
+    // Reaching the top means the user is intentionally reading history. This
+    // also covers short rooms where the top and bottom are initially the same.
+    stickToBottomRef.current = false;
     loadingMoreRef.current = true;
+    const roomId = room.id;
+    const requestId = ++historyRequestRef.current;
+    const oldScrollTop = container.scrollTop;
     const oldScrollHeight = container.scrollHeight;
 
     try {
       const firstMessageId = messages[0]?.id;
       if (!firstMessageId) return;
 
-      const res = await api.get(`/rooms/${room.id}/messages?userId=${user.id}&before=${firstMessageId}`);
+      const res = await api.get(`/rooms/${roomId}/messages?userId=${user.id}&before=${firstMessageId}`);
+      if (activeRoomIdRef.current !== roomId || historyRequestRef.current !== requestId) return;
+
       if (res.data.length === 0) {
         hasMoreRef.current = false;
         return;
       }
 
+      pendingPrependRef.current = { roomId, scrollTop: oldScrollTop, scrollHeight: oldScrollHeight };
       setMessages((prev) => [...res.data, ...prev]);
-
-      // Maintain scroll position
-      requestAnimationFrame(() => {
-        if (container) {
-          container.scrollTop = container.scrollHeight - oldScrollHeight;
-        }
-      });
     } catch (err) {
       console.error('Failed to load more messages:', err);
     } finally {
-      loadingMoreRef.current = false;
+      if (historyRequestRef.current === requestId) loadingMoreRef.current = false;
     }
-  }, [messages, room.id, user.id]);
+  }, [isNearBottom, messages, room.id, user.id]);
 
   // Socket event listeners for messages
   useEffect(() => {
@@ -142,11 +228,11 @@ export default function ChatWindow({ room, user, users, onlineUserIds, onLeaveRo
 
     const handleNewMessage = (message: MessageWithSender) => {
       if (message.roomId !== room.id) return;
+      stickToBottomRef.current = message.senderId === user.id || isNearBottom();
       setMessages((prev) => {
         if (prev.some((m) => m.id === message.id)) return prev;
         return [...prev, message];
       });
-      setTimeout(scrollToBottom, 50);
 
       // Send read receipt
       if (message.senderId !== user.id) {
@@ -267,7 +353,7 @@ export default function ChatWindow({ room, user, users, onlineUserIds, onLeaveRo
       for (const timer of typingAutoClears.values()) clearTimeout(timer);
       typingAutoClears.clear();
     };
-  }, [socket, room.id, user.id, scrollToBottom]);
+  }, [isNearBottom, socket, room.id, user.id]);
 
   // Send read receipts for visible messages
   useEffect(() => {
@@ -613,25 +699,27 @@ export default function ChatWindow({ room, user, users, onlineUserIds, onLeaveRo
   const scrollToMessage = async (messageId: number) => {
     const existingEl = document.getElementById(`msg-${messageId}`);
     if (existingEl) {
-      existingEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      stickToBottomRef.current = false;
+      centerMessageInContainer(existingEl);
       setHighlightedMessageId(messageId);
       setTimeout(() => setHighlightedMessageId(null), 2000);
       return;
     }
 
     try {
+      const roomId = room.id;
+      historyRequestRef.current += 1;
+      loadingMoreRef.current = false;
+      pendingPrependRef.current = null;
       const res = await api.get(`/rooms/${room.id}/messages/around/${messageId}`);
+      if (activeRoomIdRef.current !== roomId) return;
+
+      stickToBottomRef.current = false;
+      pendingCenteredMessageRef.current = { roomId, messageId };
       setMessages(res.data);
       hasMoreRef.current = true;
-
-      requestAnimationFrame(() => {
-        const el = document.getElementById(`msg-${messageId}`);
-        if (el) {
-          el.scrollIntoView({ behavior: 'instant', block: 'center' });
-          setHighlightedMessageId(messageId);
-          setTimeout(() => setHighlightedMessageId(null), 2000);
-        }
-      });
+      setHighlightedMessageId(messageId);
+      setTimeout(() => setHighlightedMessageId(null), 2000);
     } catch (err) {
       console.error('Failed to load messages around target:', err);
     }
@@ -671,7 +759,7 @@ export default function ChatWindow({ room, user, users, onlineUserIds, onLeaveRo
 
   return (
     <div
-      className="flex-1 flex flex-col h-full relative"
+      className="flex-1 min-w-0 min-h-0 flex flex-col h-full overflow-hidden relative"
       onDragEnter={handleDragEnter}
       onDragLeave={handleDragLeave}
       onDragOver={handleDragOver}
@@ -849,7 +937,7 @@ export default function ChatWindow({ room, user, users, onlineUserIds, onLeaveRo
       {/* Messages */}
       <div
         ref={messagesContainerRef}
-        className="flex-1 overflow-y-auto px-6 py-4 space-y-1"
+        className="flex-1 min-h-0 overflow-y-auto overscroll-contain px-6 py-4"
         onScroll={handleScroll}
       >
         {loading ? (
@@ -857,7 +945,7 @@ export default function ChatWindow({ room, user, users, onlineUserIds, onLeaveRo
             메시지 로딩 중...
           </div>
         ) : (
-          <>
+          <div ref={messagesContentRef} className="space-y-1">
             {messages.map((msg) => (
               <div
                 key={msg.id}
@@ -886,8 +974,7 @@ export default function ChatWindow({ room, user, users, onlineUserIds, onLeaveRo
                 />
               </div>
             ))}
-            <div ref={messagesEndRef} />
-          </>
+          </div>
         )}
       </div>
 

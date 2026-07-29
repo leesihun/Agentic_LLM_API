@@ -193,7 +193,7 @@ export default function ChatPage() {
   if (!user) return null;
 
   return (
-    <div className="flex h-screen bg-gray-100">
+    <div className="flex h-full min-h-0 overflow-hidden bg-gray-100">
       {/* Sidebar */}
       <Sidebar
         rooms={rooms}
@@ -209,7 +209,7 @@ export default function ChatPage() {
       />
 
       {/* Chat Window */}
-      <div className="flex-1 flex flex-col">
+      <div className="flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden">
         {selectedRoom ? (
           <ChatWindow
             room={selectedRoom}

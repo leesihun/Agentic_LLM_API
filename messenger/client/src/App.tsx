@@ -20,7 +20,7 @@ function MainLayout() {
 
   return (
     <SocketProvider>
-      <div className="flex h-screen">
+      <div className="app-viewport flex min-h-0 overflow-hidden">
         {/* Navigation Rail */}
         <div className="w-16 bg-gray-900 flex flex-col items-center py-4 gap-1 flex-shrink-0">
           {/* Logo */}
@@ -79,7 +79,7 @@ function MainLayout() {
         </div>
 
         {/* Content */}
-        <div className="flex-1 min-w-0">
+        <div className="flex-1 min-w-0 min-h-0 h-full overflow-hidden">
           {activeTab === 'chat' && <ChatPage />}
           {activeTab === 'files' && <FilesPage />}
         </div>
