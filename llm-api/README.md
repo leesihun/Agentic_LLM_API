@@ -14,9 +14,16 @@ nano config.py
 #    (GLM, Qwen3-Thinking, DeepSeek-R1) also pass --reasoning-parser so the
 #    <think>...</think> chain is lifted into reasoning_content instead of
 #    leaking into the visible answer. Match every parser to the served family.
+# Match BOTH parsers to the served family. GLM emits <arg_key>/<arg_value> XML
+# (NOT Hermes JSON), so a hermes tool parser fails to parse the call and leaks
+# the raw <tool_call> markup into the answer. GLM-5.2's tool parser is glm47.
+# --reasoning-effort max = deepest thinking (GLM-5.2 default); config.py already
+# sends chat_template_kwargs={"reasoning_effort":"max"} per request.
 vllm serve /path/to/model --port 10000 \
-  --enable-auto-tool-choice --tool-call-parser hermes \
-  --reasoning-parser glm45          # GLM-4.5/4.6/5.x; qwen3 / deepseek_r1 otherwise
+  --enable-auto-tool-choice --tool-call-parser glm47 \
+  --reasoning-parser glm45          # GLM-5.2 (GLM-4.5/4.6 use --tool-call-parser glm45)
+# Qwen3-Thinking:  --tool-call-parser hermes     --reasoning-parser qwen3
+# DeepSeek-R1:     --tool-call-parser deepseek_v3 --reasoning-parser deepseek_r1
 
 # 3. Build/install dependencies and start the API
 ./start.sh --build

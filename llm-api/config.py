@@ -98,19 +98,32 @@ CLUSTER_TASKS_CLEANUP_DAYS = int(getattr(_CLUSTER, "CLUSTER_TASKS_CLEANUP_DAYS",
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_TOP_P = 0.95
 DEFAULT_TOP_K = 40
-DEFAULT_MIN_P = 0.1
+# GLM-5.2's published sampling floor is min_p=0.01. The previous 0.1 was ~10x
+# too aggressive and clipped valid tail tokens (worse with temperature=1.0).
+DEFAULT_MIN_P = 0.01
 DEFAULT_MAX_TOKENS = 8192
 DEFAULT_REPETITION_PENALTY = 1.0   # vLLM's field is `repetition_penalty` (1.0 = no penalty)
 
 # Per-model temperature overrides (substring match on model name, lowercase).
 # Reasoning-trained models have published optimal settings — using a generic
 # default kills their performance. MiniMax explicitly recommends temperature=1.0
-# for M2; Qwen3-Thinking and DeepSeek-R1 land around 0.6-0.7.
+# for M2; Qwen3-Thinking and DeepSeek-R1 land around 0.6-0.7. GLM-5.2's official
+# recommendation is temperature=1.0, top_p=0.95 (tune only one of the two).
 MODEL_TEMPERATURE_OVERRIDES = {
+    "glm": 1.0,
     "minimax": 1.0,
     "qwen3": 0.7,
     "deepseek": 0.6,
 }
+
+# Extra chat-template kwargs forwarded to vLLM as a top-level `chat_template_kwargs`
+# body field (vLLM passes them to the served model's chat template). For GLM-5.2
+# this selects the thinking mode via `reasoning_effort`:
+#   "max"  (default) — deepest chain-of-thought, best for complex/agentic work
+#   "high"           — balanced reasoning depth vs latency
+# and {"enable_thinking": False} disables reasoning entirely (fast replies).
+# Set to {} / None to send nothing and let the server default decide.
+CHAT_TEMPLATE_KWARGS = {"reasoning_effort": "max"}
 
 # ============================================================================
 # vLLM Performance Tuning

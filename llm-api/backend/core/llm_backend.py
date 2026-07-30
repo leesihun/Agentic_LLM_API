@@ -3,6 +3,7 @@ LLM Backend for vLLM
 Fully async, with native tool calling support via OpenAI-compatible API.
 """
 import json
+import re
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, AsyncIterator
 
@@ -163,6 +164,114 @@ def _split_inline_reasoning(buf: str, in_think: bool) -> tuple[str, str, str, bo
 
 
 # ============================================================================
+# Inline tool-call extraction (defense-in-depth backstop)
+# ============================================================================
+#
+# vLLM only turns model tool-call markup into structured `tool_calls` deltas
+# when launched with `--enable-auto-tool-choice --tool-call-parser <parser>`
+# matching the served family. When the parser misses a call — a missing flag,
+# a family mismatch, or (even with the right parser) a streaming edge case where
+# the model's tokens deviate just enough from the template — the raw
+# `<tool_call>...</tool_call>` block falls through into the `content` stream and,
+# left alone, streams straight to the user as visible text. It also never
+# executes, so the agent stalls.
+#
+# This peels those blocks back out of `content` exactly as _split_inline_reasoning
+# does for `<think>`: cleanly-parsed blocks are re-emitted as real ToolCallEvents
+# (so the tool actually runs), and anything unparseable is suppressed rather than
+# leaked. Both GLM-4.5/4.6/5.x and Hermes/Qwen3 use the same `<tool_call>` /
+# `</tool_call>` delimiters; only the payload inside differs (GLM: a name line +
+# <arg_key>/<arg_value> pairs; Hermes: a JSON object). Prefer fixing the vLLM
+# launch flag; this is the belt-and-suspenders net.
+
+_TOOL_OPEN = "<tool_call>"
+_TOOL_CLOSE = "</tool_call>"
+_ARG_PAIR_RE = re.compile(
+    r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL
+)
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]*$")
+
+
+def _extract_leaked_tool_calls(buf: str, in_tool: bool) -> tuple[str, list[str], str, bool]:
+    """Split a content buffer into (clean_text, raw_blocks, carry, in_tool).
+
+    `raw_blocks` are the inner contents of each complete `<tool_call>...
+    </tool_call>` pair found. `carry` is the unresolved tail — either a possible
+    partial `<tool_call>` open tag (when not in a block) or the accumulated
+    block body so far (when a block is open but its close tag hasn't arrived) —
+    to prepend to the next chunk. Nothing is ever dropped or duplicated."""
+    text_parts: list[str] = []
+    blocks: list[str] = []
+    while buf:
+        if not in_tool:
+            i_open = buf.find(_TOOL_OPEN)
+            if i_open == -1:
+                # Hold back a trailing partial open tag split across chunks.
+                keep = _partial_tag_suffix(buf, _TOOL_OPEN)
+                text_parts.append(buf[:len(buf) - keep] if keep else buf)
+                buf = buf[len(buf) - keep:] if keep else ""
+                break
+            text_parts.append(buf[:i_open])
+            buf = buf[i_open + len(_TOOL_OPEN):]
+            in_tool = True
+        else:
+            j = buf.find(_TOOL_CLOSE)
+            if j == -1:
+                # Block still open: keep the whole remaining buffer as carry so
+                # the body accumulates until the close tag arrives next chunk.
+                break
+            blocks.append(buf[:j])
+            buf = buf[j + len(_TOOL_CLOSE):]
+            in_tool = False
+    return "".join(text_parts), blocks, buf, in_tool
+
+
+def _parse_leaked_tool_call(raw: str) -> Optional[tuple[str, dict]]:
+    """Parse one leaked tool-call block body into (name, arguments), or None.
+
+    Handles both the Hermes/Qwen3 JSON form (`{"name": ..., "arguments": ...}`)
+    and the GLM XML form (a name line followed by <arg_key>/<arg_value> pairs).
+    Returns None when the body doesn't cleanly parse into a named call — the
+    caller then suppresses it rather than executing a guess."""
+    s = raw.strip()
+    if not s:
+        return None
+
+    # Hermes / OpenAI JSON form.
+    if s.startswith("{"):
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            obj = None
+        if isinstance(obj, dict) and isinstance(obj.get("name"), str):
+            args = obj.get("arguments", obj.get("parameters", {}))
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            if isinstance(args, dict):
+                return obj["name"], args
+        return None
+
+    # GLM XML form: name line, then <arg_key>/<arg_value> pairs.
+    first_pair = _ARG_PAIR_RE.search(s)
+    name = (s[:first_pair.start()] if first_pair else s).strip().splitlines()
+    name = name[0].strip() if name else ""
+    if not _TOOL_NAME_RE.match(name):
+        return None
+    args: dict[str, Any] = {}
+    for k, v in _ARG_PAIR_RE.findall(s):
+        k = k.strip()
+        v = v.strip()
+        try:
+            args[k] = json.loads(v)
+        except json.JSONDecodeError:
+            args[k] = v
+    return name, args
+
+
+# ============================================================================
 # vLLM Backend
 # ============================================================================
 
@@ -302,6 +411,13 @@ class VllmBackend:
             payload["guided_json"] = guided_json
         if response_format is not None:
             payload["response_format"] = response_format
+        # Chat-template kwargs (e.g. GLM-5.2 `reasoning_effort: "max"` for max
+        # thinking). Forwarded as a top-level body field — this is what the
+        # OpenAI SDK's `extra_body={"chat_template_kwargs": {...}}` desugars to —
+        # and vLLM hands it to the served model's chat template.
+        chat_template_kwargs = getattr(config, "CHAT_TEMPLATE_KWARGS", None)
+        if chat_template_kwargs:
+            payload["chat_template_kwargs"] = chat_template_kwargs
         return payload
 
     # ------------------------------------------------------------------
@@ -341,6 +457,13 @@ class VllmBackend:
         # across chunks; in_think tracks whether we're inside a think block.
         think_buf = ""
         in_think = False
+        # State for the tool-call backstop: peel inline <tool_call>...</tool_call>
+        # markup the vLLM parser missed back out of content (see
+        # _extract_leaked_tool_calls). tool_buf carries a partial tag / open block
+        # across chunks; leaked_seq gives recovered calls a stable id.
+        tool_buf = ""
+        in_tool = False
+        leaked_seq = 0
 
         async with self._client.stream(
             "POST",
@@ -398,7 +521,29 @@ class VllmBackend:
                     if reason_out:
                         yield ReasoningEvent(content=reason_out)
                     if text_out:
-                        yield TextEvent(content=text_out)
+                        # Backstop: peel any tool-call markup the vLLM parser
+                        # missed out of the visible text before it reaches the
+                        # user, and re-emit recovered calls so they execute.
+                        tool_buf += text_out
+                        clean_text, raw_blocks, tool_buf, in_tool = (
+                            _extract_leaked_tool_calls(tool_buf, in_tool)
+                        )
+                        if clean_text:
+                            yield TextEvent(content=clean_text)
+                        for raw_block in raw_blocks:
+                            parsed = _parse_leaked_tool_call(raw_block)
+                            if parsed is None:
+                                continue  # unparseable → suppressed, never leaked
+                            name, args = parsed
+                            leaked_seq += 1
+                            yield ToolCallDeltaEvent(
+                                tool_calls=[ToolCall(
+                                    id=f"leaked_{leaked_seq}",
+                                    function=ToolCallFunction(name=name, arguments=args),
+                                )],
+                                finish_reason="tool",
+                                is_partial=True,
+                            )
 
                 # Tool call deltas
                 if "tool_calls" in delta:
@@ -470,13 +615,39 @@ class VllmBackend:
                             except json.JSONDecodeError:
                                 pass  # still accumulating
 
-        # Flush any held-back content tail (a partial tag that never completed,
-        # or reasoning left open because the stream ended mid-think).
+        # Flush any held-back reasoning/content tail. Reasoning left open (stream
+        # ended mid-think) surfaces as reasoning; leftover visible text still runs
+        # through the tool-call backstop before being emitted.
         if think_buf:
             if in_think:
                 yield ReasoningEvent(content=think_buf)
             else:
-                yield TextEvent(content=think_buf)
+                tool_buf += think_buf
+                clean_text, raw_blocks, tool_buf, in_tool = (
+                    _extract_leaked_tool_calls(tool_buf, in_tool)
+                )
+                if clean_text:
+                    yield TextEvent(content=clean_text)
+                for raw_block in raw_blocks:
+                    parsed = _parse_leaked_tool_call(raw_block)
+                    if parsed is None:
+                        continue
+                    name, args = parsed
+                    leaked_seq += 1
+                    yield ToolCallDeltaEvent(
+                        tool_calls=[ToolCall(
+                            id=f"leaked_{leaked_seq}",
+                            function=ToolCallFunction(name=name, arguments=args),
+                        )],
+                        finish_reason="tool",
+                        is_partial=True,
+                    )
+
+        # Flush the tool backstop tail. An open block at stream end is a
+        # truncated tool call — suppress it (leaking the raw markup is exactly
+        # the bug). A leftover partial open-tag prefix is just literal text.
+        if tool_buf and not in_tool:
+            yield TextEvent(content=tool_buf)
 
         # After the stream finishes, yield any tool calls not yet dispatched
         remaining: list[ToolCall] = []

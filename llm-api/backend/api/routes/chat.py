@@ -258,7 +258,12 @@ async def chat_completions(
         # model so any client placeholder works.
         model_name = config.VLLM_MODEL
         is_streaming = parsed["stream"]
-        temp = parsed["temperature"] if parsed["temperature"] is not None else config.DEFAULT_TEMPERATURE
+        # Leave unset (None) when the client didn't specify one, so
+        # AgentLoop._resolve_temperature can apply MODEL_TEMPERATURE_OVERRIDES
+        # (e.g. GLM -> 1.0) before falling back to DEFAULT_TEMPERATURE. Passing
+        # DEFAULT_TEMPERATURE here would count as an explicit value and bypass
+        # the per-model override entirely.
+        temp = parsed["temperature"]
         session_id = parsed["session_id"]
         workspace = parsed["workspace"]
         mode = parsed["mode"]
