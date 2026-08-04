@@ -235,7 +235,9 @@ CLUSTER_NODE_STALE_SECONDS = int(_env("CLUSTER_NODE_STALE_SECONDS", "90"))
 CLUSTER_TASK_LEASE_SECONDS = int(_env("CLUSTER_TASK_LEASE_SECONDS", "900"))
 CLUSTER_SLAVE_POLL_INTERVAL_SECONDS = float(_env("CLUSTER_SLAVE_POLL_INTERVAL_SECONDS", "3"))
 # Max cluster tasks a slave executes concurrently (vLLM batches the requests).
-CLUSTER_SLAVE_MAX_CONCURRENT_TASKS = int(_env("CLUSTER_SLAVE_MAX_CONCURRENT_TASKS", "4"))
+# Higher = more headroom so a few slow/hung slots can't starve the whole slave;
+# hung slots now self-release via the LLM timeout (see hoonbot LLM_TIMEOUT_SECONDS).
+CLUSTER_SLAVE_MAX_CONCURRENT_TASKS = int(_env("CLUSTER_SLAVE_MAX_CONCURRENT_TASKS", "20"))
 
 if NODE_ROLE == "master":
     _default_caps = ["orchestrator", "messenger", "llm-api"]

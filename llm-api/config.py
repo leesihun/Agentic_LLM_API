@@ -134,6 +134,17 @@ CHAT_TEMPLATE_KWARGS = {"reasoning_effort": "max"}
 # automatic prefix cache hits across iterations.
 VLLM_CONNECTION_POOL_SIZE = 20
 
+# vLLM streaming idle timeout (seconds). This is an INTER-CHUNK (httpx read)
+# timeout, not a total-turn cap: it only fires when vLLM sends NO bytes for this
+# long, so a healthy turn that keeps streaming tokens — however long — is never
+# cut off, while a genuine stall (GPU wedged / stream hung) is killed so the
+# agent loop errors out instead of hanging forever and pinning a cluster slot.
+# Must exceed worst-case time-to-first-token under load (requests queued behind
+# others on a busy vLLM). None = never time out (old behaviour). 1200s = 20 min.
+STREAM_READ_TIMEOUT = 1200
+# Finite connect timeout so a dead vLLM fails fast rather than hanging.
+STREAM_CONNECT_TIMEOUT = 10.0
+
 # ============================================================================
 # Logging Settings (before Agent — agent log target references PROMPTS_LOG_PATH)
 # ============================================================================

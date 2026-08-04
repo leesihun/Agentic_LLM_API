@@ -148,11 +148,16 @@ HEARTBEAT_ACTIVE_END = getattr(_CLUSTER, "HEARTBEAT_ACTIVE_END", "23:59")
 # Debounce window for rapid messages (seconds). Messages within this window
 # are combined into one LLM call.
 DEBOUNCE_SECONDS = 1.5
-# LLM request timeout (seconds). None = no read timeout, so long tool-heavy
-# turns and delegated cluster tasks are never cut off mid-run — the call falls
-# back to the shared client's read=None (see core/llm_api.get_client). The
-# client keeps a finite connect timeout, so a dead LLM API still fails fast.
-LLM_TIMEOUT_SECONDS = None
+# LLM request timeout (seconds) for the non-streaming cluster-task path
+# (core/cluster_worker._execute_task → core/llm_api.chat). The cluster call is
+# NON-streaming, so this acts as a hard wall-clock cap on a delegated task: if a
+# turn hasn't returned within this window (e.g. vLLM stalled), the call raises,
+# the slave marks the task failed, and its concurrency slot is released instead
+# of being held forever. 1200s = 20 min. Interactive/streaming paths are
+# unaffected (they use the shared client's read=None + SSE keepalive pings); the
+# server-side llm-api → vLLM idle timeout (STREAM_READ_TIMEOUT) is the deeper
+# stall killer that also stops the churn inside llm-api itself.
+LLM_TIMEOUT_SECONDS = 1200
 # Max startup retry attempts for Messenger registration / webhook setup.
 STARTUP_RETRY_ATTEMPTS = 6
 # Base delay between startup retries (seconds, doubles each attempt).
