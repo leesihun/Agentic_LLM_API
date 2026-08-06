@@ -80,6 +80,13 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
         # Real prompt-token count from the last LLM call (vLLM usage), used to
         # drive proactive compaction. 0 until the first call reports usage.
         self._last_prompt_tokens: int = 0
+        # finish_reason of the last streamed LLM call (set by _stream_with_autocompact
+        # from the terminal UsageEvent). "length" means the turn was truncated at
+        # the token ceiling. Consumed in _run_stream_body to auto-continue.
+        self._last_finish_reason: str = "stop"
+        # Count of truncation auto-continues in the current run (bounded by
+        # AGENT_MAX_TRUNCATION_CONTINUATIONS). Reset per run in _run_stream_body.
+        self._truncation_continuations: int = 0
         # Per-run memoization of read-only/concurrency-safe tool results, keyed by
         # (tool_name, arg_hash). Serves duplicate reads instantly; cleared by any
         # mutating tool. See DispatchMixin.execute_tool.
@@ -496,6 +503,13 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
             kwargs["max_tokens"] = config.DEFAULT_MAX_TOKENS
         else:
             kwargs["max_tokens"] = config.AGENT_TOOL_LOOP_MAX_TOKENS
+        # Agent-loop reasoning depth. "high" is a big latency win over the global
+        # "max" default across a multi-iteration tool loop; the per-call override
+        # (see llm_backend._build_payload) wins over CHAT_TEMPLATE_KWARGS. None
+        # falls back to the global default.
+        effort = getattr(config, "AGENT_REASONING_EFFORT", None)
+        if effort:
+            kwargs["chat_template_kwargs"] = {"reasoning_effort": effort}
         # Structured/guided decoding is opt-in per request. When the caller sets
         # it they want a constrained answer, so forward it on the agent's calls.
         if getattr(self, "response_format", None) is not None:
@@ -587,6 +601,7 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
         msgs.extend(messages)
         self._enforce_history_limit(msgs)
         tool_schemas = self._get_tool_schemas()
+        self._truncation_continuations = 0
 
         for iteration in range(self.max_iterations):
             check_stop(self.session_id)
@@ -651,6 +666,31 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
                             )
 
             if not all_tool_calls:
+                # Output truncated at the token ceiling (finish_reason=length):
+                # the model was cut off mid-answer or mid-<think>, not actually
+                # done — and a partial tool call, if any, was already suppressed
+                # by the backstop. Don't silently end: preserve what it produced
+                # and continue so it can finish, bounded so the run terminates.
+                max_cont = getattr(config, "AGENT_MAX_TRUNCATION_CONTINUATIONS", 3)
+                if self._last_finish_reason == "length" and self._truncation_continuations < max_cont:
+                    self._truncation_continuations += 1
+                    text_body = "".join(streamed_text_parts).strip()
+                    reasoning_body = "".join(streamed_reasoning_parts).strip()
+                    if reasoning_body:
+                        partial = (
+                            f"<think>\n{reasoning_body}\n</think>\n\n{text_body}"
+                            if text_body else f"<think>\n{reasoning_body}\n</think>"
+                        )
+                    else:
+                        partial = text_body
+                    if partial:
+                        msgs.append({"role": "assistant", "content": partial})
+                    self._log(
+                        f"[AGENT] Output truncated (finish_reason=length) — continuing "
+                        f"({self._truncation_continuations}/{max_cont})"
+                    )
+                    continue
+
                 # Empty stream after tool results: model produced no text and no
                 # tool calls. Some chat templates emit an end-of-turn token right
                 # after a tool result, leaving the user with nothing. Retry once

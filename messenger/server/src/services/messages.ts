@@ -115,19 +115,29 @@ export function createMessage(input: CreateMessageInput) {
  * Edit a message (sender-owned only). Returns the broadcast payload, or an
  * error string when the message is missing or owned by someone else.
  */
-export function editMessage(messageId: number, senderId: number, content: string):
+export function editMessage(messageId: number, senderId: number, content: string, draft = false):
   | { payload: { messageId: number; content: string; updatedAt: string } }
   | { error: string } {
   const message = queryOne('SELECT sender_id, room_id FROM messages WHERE id = ?', [messageId]);
   if (!message) return { error: 'Message not found.' };
   if (message.sender_id !== senderId) return { error: 'You can only edit your own messages.' };
 
-  run("UPDATE messages SET content = ?, is_edited = 1, updated_at = datetime('now') WHERE id = ?", [content, messageId]);
+  // A draft edit is a live streaming update of the sender's own in-flight
+  // message (the bot streaming its reply token-by-token), not a user edit. Skip
+  // the is_edited flag and the message_edited webhook dispatch — the message was
+  // already announced via new_message, and firing webhooks ~4×/s with a growing
+  // payload is the streaming hot-path cost we want gone. Still broadcast to the
+  // room so connected clients see the live text.
+  if (draft) {
+    run("UPDATE messages SET content = ?, updated_at = datetime('now') WHERE id = ?", [content, messageId]);
+  } else {
+    run("UPDATE messages SET content = ?, is_edited = 1, updated_at = datetime('now') WHERE id = ?", [content, messageId]);
+  }
   const updated = queryOne('SELECT updated_at FROM messages WHERE id = ?', [messageId]);
   const payload = { messageId, content, updatedAt: updated.updated_at };
 
   getIo()?.to(`room:${message.room_id}`).emit('message_edited', payload);
-  dispatchWebhooks('message_edited', message.room_id, payload);
+  if (!draft) dispatchWebhooks('message_edited', message.room_id, payload);
 
   return { payload };
 }

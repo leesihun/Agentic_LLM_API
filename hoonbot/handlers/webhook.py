@@ -668,6 +668,32 @@ def _format_tool_status(running_tools: dict[str, str]) -> str:
     return " + ".join(running_tools.values()) + " 사용 중"
 
 
+def _render_tool_log(tool_log: list[dict]) -> str:
+    """Render the ordered tool-call log as a compact in-bubble worklog.
+
+    Unlike the transient bottom typing indicator (which only shows tools that
+    are running *right now*), this persists every tool call in start order with
+    its outcome — ⏳ running, ✅ done (+elapsed), ❌ failed — so the user can see
+    what actually ran. The client renderer supports only bold/italic/code, so
+    this uses emoji + plain text.
+    """
+    if not tool_log:
+        return ""
+    icons = {"running": "⏳", "completed": "✅", "failed": "❌"}
+    lines = ["🔧 **작업**"]
+    for e in tool_log:
+        icon = icons.get(e.get("state"), "•")
+        label = e.get("label") or "?"
+        if e.get("state") == "completed":
+            dur = e.get("duration") or 0.0
+            lines.append(f"{icon} {label}" + (f" · {dur:.1f}s" if dur else ""))
+        elif e.get("state") == "failed":
+            lines.append(f"{icon} {label} · 실패")
+        else:
+            lines.append(f"{icon} {label} …")
+    return "\n".join(lines)
+
+
 async def _process_streaming(room_id: int, llm_data: dict, headers: dict, existing_session_id: str | None, log_prefix: str, reply_to_id: int | None, downloaded_files: list[tuple[str, bytes]] | None = None) -> str | None:
     """Stream SSE from LLM API into a single live-edited Messenger bubble.
 
@@ -696,6 +722,12 @@ async def _process_streaming(room_id: int, llm_data: dict, headers: dict, existi
     # it gets the answer divider at settle time (styling only, never a split).
     final_split_pos: int = 0
     running_tools: dict[str, str] = {}  # tool_call_id -> tool_name, insertion-ordered
+    # Persistent, ordered tool-call log for the in-bubble worklog checklist
+    # (see _render_tool_log). Distinct from running_tools, which only feeds the
+    # transient bottom typing indicator. tool_log_index maps tool_call_id -> the
+    # same dict for O(1) status updates on completed/failed.
+    tool_log: list[dict] = []
+    tool_log_index: dict[str, dict] = {}
     session_id_from_header: str | None = None
     draft_msg_id: int | None = None   # ID of the live text-draft message in chat
     last_draft_edit: float = 0.0
@@ -754,6 +786,15 @@ async def _process_streaming(room_id: int, llm_data: dict, headers: dict, existi
                 pass
             flush_task = None
 
+    def _compose_draft(body: str) -> str:
+        """Prepend the live tool-call checklist above the streamed text so the
+        bubble shows what ran (with per-tool state) as well as the answer."""
+        block = _render_tool_log(tool_log)
+        body = (body or "").strip()
+        if block and body:
+            return f"{block}\n\n{body}"
+        return block or body
+
     try:
         client = get_client()
         async with client.stream(
@@ -801,11 +842,30 @@ async def _process_streaming(room_id: int, llm_data: dict, headers: dict, existi
                     tool_name = ts.get("tool_name", "")
                     tool_key = ts.get("tool_call_id") or tool_name
                     status = ts.get("status", "")
+                    label = ts.get("user_name") or ts.get("activity") or tool_name
                     if status == "started":
                         running_tools[tool_key] = tool_name
+                        entry = tool_log_index.get(tool_key)
+                        if entry is None:
+                            entry = {"label": label, "state": "running", "duration": 0.0}
+                            tool_log.append(entry)
+                            tool_log_index[tool_key] = entry
+                        else:
+                            entry["state"] = "running"
                     elif status in {"completed", "failed"}:
                         running_tools.pop(tool_key, None)
+                        entry = tool_log_index.get(tool_key)
+                        if entry is None:
+                            entry = {"label": label, "state": status, "duration": ts.get("duration") or 0.0}
+                            tool_log.append(entry)
+                            tool_log_index[tool_key] = entry
+                        else:
+                            entry["state"] = status
+                            entry["duration"] = ts.get("duration") or entry.get("duration") or 0.0
                     await messenger.send_typing(room_id, status_text=_format_tool_status(running_tools))
+                    # Update the in-bubble checklist live — tools often run before
+                    # any answer text, so this may create the draft bubble too.
+                    _schedule_flush(_compose_draft(full_text))
                     continue
 
                 if "x_session_id" in event:
@@ -826,16 +886,16 @@ async def _process_streaming(room_id: int, llm_data: dict, headers: dict, existi
                             # generation starts instead of up to one interval late.
                             first_sent = True
                             last_draft_edit = now
-                            _schedule_flush(stripped)
+                            _schedule_flush(_compose_draft(full_text))
                         elif now - last_draft_edit >= _DRAFT_EDIT_INTERVAL_SECONDS:
                             last_draft_edit = now
-                            _schedule_flush(stripped)
+                            _schedule_flush(_compose_draft(full_text))
 
     except httpx.ReadTimeout:
         logger.warning(f"{log_prefix} Stream read timeout after collecting {len(full_text)} chars")
         await _settle_flush()
         if full_text.strip():
-            msg = full_text.strip() + "\n\n⚠️ (응답이 시간 초과로 잘렸어요)"
+            msg = _compose_draft(full_text.strip() + "\n\n⚠️ (응답이 시간 초과로 잘렸어요)")
             if draft_msg_id is not None:
                 await messenger.edit_message(draft_msg_id, msg)
             else:
@@ -850,7 +910,7 @@ async def _process_streaming(room_id: int, llm_data: dict, headers: dict, existi
         if draft_msg_id is not None:
             try:
                 if full_text.strip():
-                    await messenger.edit_message(draft_msg_id, full_text.strip() + "\n\n⏹️ 중지됨")
+                    await messenger.edit_message(draft_msg_id, _compose_draft(full_text.strip() + "\n\n⏹️ 중지됨"))
                 else:
                     await messenger.delete_message(draft_msg_id)
             except Exception:
@@ -866,7 +926,7 @@ async def _process_streaming(room_id: int, llm_data: dict, headers: dict, existi
                 if full_text.strip():
                     await messenger.edit_message(
                         draft_msg_id,
-                        full_text.strip() + "\n\n⚠️ 오류가 발생해 응답이 중단되었어요.",
+                        _compose_draft(full_text.strip() + "\n\n⚠️ 오류가 발생해 응답이 중단되었어요."),
                     )
                 else:
                     await messenger.delete_message(draft_msg_id)
@@ -896,6 +956,11 @@ async def _process_streaming(room_id: int, llm_data: dict, headers: dict, existi
     answer_text = full_text[final_split_pos:].strip()
     if worklog_text and answer_text:
         final_text = f"{worklog_text}\n\n{_ANSWER_DIVIDER}\n\n{answer_text}"
+
+    # Prepend the structured tool-call checklist above the answer. When tools
+    # ran but the model produced no text, this shows the checklist instead of
+    # the bare "완료." fallback.
+    final_text = _compose_draft(final_text)
 
     if draft_msg_id is not None:
         # A live draft was already posted — settle it to the final text or clean up

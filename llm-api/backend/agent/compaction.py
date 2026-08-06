@@ -389,6 +389,9 @@ class CompactionMixin:
         """
         enabled = getattr(config, "AGENT_AUTOCOMPACT_ENABLED", True)
         max_retries = max(0, getattr(config, "AGENT_AUTOCOMPACT_MAX_RETRIES", 2))
+        # Reset per-stream; the terminal UsageEvent (swallowed below) refreshes it
+        # so the loop can read this call's finish_reason after the stream drains.
+        self._last_finish_reason = "stop"
 
         # PROACTIVE compaction: if the previous call's REAL prompt-token count
         # (from vLLM usage) crossed the budget, summarize now — before sending —
@@ -420,6 +423,7 @@ class CompactionMixin:
                     # then swallow it — downstream consumers don't handle it.
                     if isinstance(event, UsageEvent):
                         self._last_prompt_tokens = event.prompt_tokens
+                        self._last_finish_reason = getattr(event, "finish_reason", "stop")
                         continue
                     events_yielded = True
                     yield event

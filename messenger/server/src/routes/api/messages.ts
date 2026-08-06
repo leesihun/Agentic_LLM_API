@@ -231,7 +231,7 @@ router.get('/messages/:roomId', (req: Request, res: Response) => {
 
 // POST /api/edit-message
 router.post('/edit-message', (req: Request, res: Response) => {
-  const { messageId, content } = req.body;
+  const { messageId, content, draft = false } = req.body;
   if (!messageId || content === undefined) {
     res.status(400).json({ error: 'messageId and content are required.' });
     return;
@@ -243,7 +243,7 @@ router.post('/edit-message', (req: Request, res: Response) => {
     return;
   }
 
-  const result = editMessage(Number(messageId), sender.id, content);
+  const result = editMessage(Number(messageId), sender.id, content, Boolean(draft));
   if ('error' in result) {
     res.status(result.error === 'Message not found.' ? 404 : 403).json({ error: result.error });
     return;

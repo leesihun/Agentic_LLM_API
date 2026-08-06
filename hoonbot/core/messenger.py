@@ -188,15 +188,22 @@ async def send_message_returning_id(
         return None
 
 
-async def edit_message(message_id: int, content: str) -> None:
-    """Edit a previously sent message."""
+async def edit_message(message_id: int, content: str, draft: bool = True) -> None:
+    """Edit a previously sent message.
+
+    draft=True (the default — every caller is a live streaming update) tells the
+    server this is a streaming draft edit, not a user edit. The server then skips
+    the per-edit message_edited webhook dispatch (which otherwise fires ~4×/s
+    with a growing payload) and the is_edited flag, so streaming stays cheap. The
+    room broadcast still happens so clients see the live text.
+    """
     try:
         async def _edit():
             client = _get_client()
             resp = await client.post(
                 f"{config.MESSENGER_URL}/api/edit-message",
                 headers=_headers(),
-                json={"messageId": message_id, "content": content},
+                json={"messageId": message_id, "content": content, "draft": draft},
             )
             resp.raise_for_status()
 

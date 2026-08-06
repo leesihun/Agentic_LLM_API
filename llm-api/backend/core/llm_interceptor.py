@@ -213,6 +213,7 @@ class LLMInterceptor:
         repetition_penalty: float = None,
         guided_json: dict = None,
         response_format: dict = None,
+        chat_template_kwargs: dict = None,
     ) -> AsyncIterator:
         """Yields StreamEvent objects from backend.chat_stream()."""
         start_time = time.time()
@@ -254,6 +255,7 @@ class LLMInterceptor:
                 top_p=top_p, top_k=top_k, min_p=min_p,
                 max_tokens=max_tokens, repetition_penalty=repetition_penalty,
                 guided_json=guided_json, response_format=response_format,
+                chat_template_kwargs=chat_template_kwargs,
             ):
                 if isinstance(event, TextEvent):
                     collected_text += event.content

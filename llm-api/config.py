@@ -101,7 +101,14 @@ DEFAULT_TOP_K = 40
 # GLM-5.2's published sampling floor is min_p=0.01. The previous 0.1 was ~10x
 # too aggressive and clipped valid tail tokens (worse with temperature=1.0).
 DEFAULT_MIN_P = 0.01
-DEFAULT_MAX_TOKENS = 8192
+# Per-turn OUTPUT token ceiling. On a reasoning model at high/max effort the
+# hidden <think> block alone can eat thousands of tokens, so a small cap here
+# truncates the turn mid-thought or mid-tool-call (the call is then suppressed —
+# see llm_backend _extract_leaked_tool_calls — and the turn silently ends). The
+# served model is long-context (~1M), so keep generous headroom. vLLM allocates
+# KV incrementally, so a high ceiling costs nothing unless actually generated;
+# it only needs prompt_tokens + max_tokens <= the served model's max_model_len.
+DEFAULT_MAX_TOKENS = 100000
 DEFAULT_REPETITION_PENALTY = 1.0   # vLLM's field is `repetition_penalty` (1.0 = no penalty)
 
 # Per-model temperature overrides (substring match on model name, lowercase).
@@ -172,7 +179,21 @@ SUBAGENT_TIMEOUT_SECONDS = 1800
 # The model can still request lower values; this only clamps obvious mistakes
 # (e.g. timeout=86400) that would let a runaway command wedge the agent loop.
 SHELL_EXEC_HARD_CAP_SECONDS = 3600
-AGENT_TOOL_LOOP_MAX_TOKENS = 8192
+# Output ceiling for intermediate tool-loop turns. Same rationale as
+# DEFAULT_MAX_TOKENS — must fit reasoning + tool-call args without truncation.
+AGENT_TOOL_LOOP_MAX_TOKENS = 100000
+# Reasoning effort for the agent loop (GLM-5.2: "max" | "high"). "max" = deepest
+# chain-of-thought (best for complex/agentic work); "high" trades some depth for
+# lower latency across a multi-iteration loop. Truncation is handled by the token
+# ceilings above, so this is a quality/latency lever, not a correctness one.
+# None = fall back to the global CHAT_TEMPLATE_KWARGS default. Applied per-call
+# via _sampling_kwargs. NOTE: only effective if the served model's chat template
+# actually branches on these reasoning_effort values — verify against the model.
+AGENT_REASONING_EFFORT = "max"
+# Max times a single run may auto-continue after an output truncation
+# (finish_reason=length) before giving up — bounds runaway while ensuring a
+# cut-off turn is resumed instead of silently ending. See agent/loop.py.
+AGENT_MAX_TRUNCATION_CONTINUATIONS = 3
 AGENT_SYSTEM_PROMPT = "system.txt"
 AGENT_DYNAMIC_CONTEXT_MAX_CHARS = 12000
 AGENT_REPO_DOC_CONTEXT_MAX_CHARS = 6000

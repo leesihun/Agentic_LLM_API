@@ -88,6 +88,11 @@ class UsageEvent(StreamEvent):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    # vLLM's finish_reason for the completed stream ("stop" | "length" | "tool"
+    # | ...). Carried on this end-of-stream event so the agent loop can detect a
+    # truncated turn (finish_reason == "length") even when no tool call was
+    # emitted — the only event type that otherwise carries it is ToolCallDeltaEvent.
+    finish_reason: str = "stop"
 
 
 # ============================================================================
@@ -374,6 +379,7 @@ class VllmBackend:
         repetition_penalty: Optional[float] = None,
         guided_json: Optional[dict] = None,
         response_format: Optional[dict] = None,
+        chat_template_kwargs: Optional[dict] = None,
     ) -> dict[str, Any]:
         """Assemble the request payload with all vLLM parameters.
 
@@ -414,10 +420,13 @@ class VllmBackend:
         # Chat-template kwargs (e.g. GLM-5.2 `reasoning_effort: "max"` for max
         # thinking). Forwarded as a top-level body field — this is what the
         # OpenAI SDK's `extra_body={"chat_template_kwargs": {...}}` desugars to —
-        # and vLLM hands it to the served model's chat template.
-        chat_template_kwargs = getattr(config, "CHAT_TEMPLATE_KWARGS", None)
-        if chat_template_kwargs:
-            payload["chat_template_kwargs"] = chat_template_kwargs
+        # and vLLM hands it to the served model's chat template. A per-call
+        # override (agent loop passes reasoning_effort="high") wins over the
+        # global default so different call sites can tune thinking depth.
+        effective_ctk = chat_template_kwargs if chat_template_kwargs is not None \
+            else getattr(config, "CHAT_TEMPLATE_KWARGS", None)
+        if effective_ctk:
+            payload["chat_template_kwargs"] = effective_ctk
         return payload
 
     # ------------------------------------------------------------------
@@ -437,6 +446,7 @@ class VllmBackend:
         repetition_penalty: Optional[float] = None,
         guided_json: Optional[dict] = None,
         response_format: Optional[dict] = None,
+        chat_template_kwargs: Optional[dict] = None,
     ) -> AsyncIterator[StreamEvent]:
         await self._select_available_host(prefer_active=True)
         payload = self._build_payload(
@@ -444,6 +454,7 @@ class VllmBackend:
             tools=tools, top_p=top_p, top_k=top_k, min_p=min_p,
             max_tokens=max_tokens, repetition_penalty=repetition_penalty,
             guided_json=guided_json, response_format=response_format,
+            chat_template_kwargs=chat_template_kwargs,
         )
 
         # State for accumulating tool call deltas across SSE chunks
@@ -669,11 +680,14 @@ class VllmBackend:
             )
 
         # Emit real token usage last so the agent loop can size the next call.
+        # Carries finish_reason so the loop can detect a truncated turn
+        # (finish_reason == "length") even for a text-only completion.
         if usage:
             yield UsageEvent(
                 prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
                 completion_tokens=int(usage.get("completion_tokens", 0) or 0),
                 total_tokens=int(usage.get("total_tokens", 0) or 0),
+                finish_reason=finish_reason,
             )
 
 
