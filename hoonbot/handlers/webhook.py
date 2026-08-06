@@ -654,7 +654,11 @@ _ANSWER_DIVIDER = "──────────\n✅ **답변**"
 # How often the live draft bubble is updated while tokens stream in. Sends are
 # fire-and-forget/coalesced (see _process_streaming's flush pump) so this can
 # be low without ever blocking token consumption on a slow Messenger round trip.
-_DRAFT_EDIT_INTERVAL_SECONDS = 0.25
+# NOTE: each edit re-sends the *full* accumulated text (hoonbot->messenger and
+# messenger->all clients), so a lower interval smooths short replies but ~2.5x's
+# the transport/re-render cost on long ones — consider an adaptive interval that
+# widens as the message grows if long-answer load becomes a problem.
+_DRAFT_EDIT_INTERVAL_SECONDS = 0.1
 
 def _format_tool_status(running_tools: dict[str, str]) -> str:
     """Return the typing-indicator text for the current set of running tools.
