@@ -1,0 +1,302 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="1060" viewBox="0 0 1500 1060">
+<defs>
+<marker id="ah-k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#3a3a3a"/></marker>
+<marker id="as-k" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M10,0 L0,5 L10,10 z" fill="#3a3a3a"/></marker>
+<marker id="ah-o" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#b5651d"/></marker>
+<marker id="as-o" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M10,0 L0,5 L10,10 z" fill="#b5651d"/></marker>
+<marker id="ah-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#2f7a45"/></marker>
+<marker id="as-g" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M10,0 L0,5 L10,10 z" fill="#2f7a45"/></marker>
+</defs>
+<rect width="1500" height="1060" fill="#ffffff"/>
+<rect x="15" y="15" width="200" height="745" rx="8" fill="#f6f6f6" stroke="#555" stroke-width="1.4"/>
+<circle cx="35" cy="35" r="11" fill="#1b1b1b"/>
+<text x="35" y="40.0" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="bold" font-style="normal" fill="#fff" text-anchor="middle">A</text>
+<text x="53" y="41.0" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Interfaces</text>
+<rect x="28" y="58" width="174" height="78" rx="6" fill="#fff" stroke="#3a3a3a" stroke-width="1.3"/>
+<text x="40" y="80.0" font-family="Arial, Helvetica, sans-serif" font-size="14.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Chat Messenger</text>
+<text x="40" y="100.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">web &amp; desktop client</text>
+<text x="40" y="116.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">real-time, multi-user</text>
+<rect x="28" y="152" width="174" height="94" rx="6" fill="#fff" stroke="#3a3a3a" stroke-width="1.3"/>
+<text x="40" y="174.0" font-family="Arial, Helvetica, sans-serif" font-size="14.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Autonomous Bot</text>
+<text x="40" y="194.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">webhook-driven</text>
+<text x="40" y="210.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">long-term memory</text>
+<text x="40" y="226.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">scheduled heartbeat</text>
+<rect x="28" y="262" width="174" height="96" rx="6" fill="#fff" stroke="#3a3a3a" stroke-width="1.3"/>
+<text x="40" y="284.0" font-family="Arial, Helvetica, sans-serif" font-size="14.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">OpenAI-compatible</text>
+<text x="40" y="302.0" font-family="Arial, Helvetica, sans-serif" font-size="14.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Clients</text>
+<text x="40" y="322.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">REST / SSE</text>
+<text x="40" y="338.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">SDKs, scripts</text>
+<rect x="28" y="374" width="174" height="96" rx="6" fill="#fff" stroke="#3a3a3a" stroke-width="1.3"/>
+<text x="40" y="396.0" font-family="Arial, Helvetica, sans-serif" font-size="14.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Cluster Worker</text>
+<text x="40" y="414.0" font-family="Arial, Helvetica, sans-serif" font-size="14.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Nodes</text>
+<text x="40" y="434.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">distributed task</text>
+<text x="40" y="450.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">delegation</text>
+<path d="M202,97.0 H224" fill="none" stroke="#3a3a3a" stroke-width="1.5" marker-start="url(#as-k)"/>
+<path d="M202,199.0 H224" fill="none" stroke="#3a3a3a" stroke-width="1.5" marker-start="url(#as-k)"/>
+<path d="M202,310.0 H224" fill="none" stroke="#3a3a3a" stroke-width="1.5" marker-start="url(#as-k)"/>
+<path d="M202,422.0 H224" fill="none" stroke="#3a3a3a" stroke-width="1.5" marker-start="url(#as-k)"/>
+<path d="M224,422.0 V88 H247" fill="none" stroke="#3a3a3a" stroke-width="1.5" marker-end="url(#ah-k)"/>
+<text x="28" y="590.0" font-family="Arial, Helvetica, sans-serif" font-size="13.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Notation</text>
+<rect x="28" y="602" width="34" height="20" rx="3" fill="#fff" stroke="#3a3a3a" stroke-width="1.2"/>
+<text x="70" y="617.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">process step</text>
+<polygon points="45,630 62,641 45,652 28,641" fill="#fff" stroke="#3a3a3a" stroke-width="1.2"/>
+<text x="70" y="646.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">decision</text>
+<rect x="28" y="660" width="34" height="18" rx="9" fill="#fff" stroke="#3a3a3a" stroke-width="1.2"/>
+<text x="70" y="674.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">terminal</text>
+<path d="M28,694 H62" fill="none" stroke="#3a3a3a" stroke-width="1.5" marker-end="url(#ah-k)"/>
+<text x="70" y="698.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">control flow</text>
+<path d="M28,716 H62" fill="none" stroke="#b5651d" stroke-width="1.8" stroke-dasharray="5,3" marker-end="url(#ah-o)"/>
+<text x="70" y="720.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">LLM inference</text>
+<path d="M28,738 H62" fill="none" stroke="#2f7a45" stroke-width="1.8" marker-end="url(#ah-g)" marker-start="url(#as-g)"/>
+<text x="70" y="742.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">tool invocation</text>
+<rect x="232" y="15" width="768" height="745" rx="8" fill="#f7f8fa" stroke="#555" stroke-width="1.4"/>
+<circle cx="252" cy="35" r="11" fill="#1b1b1b"/>
+<text x="252" y="40.0" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="bold" font-style="normal" fill="#fff" text-anchor="middle">B</text>
+<text x="270" y="41.0" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">LLM API Server</text>
+<rect x="247" y="50" width="738" height="78" rx="6" fill="#fff" stroke="#3a3a3a" stroke-width="1.3"/>
+<text x="259" y="72.0" font-family="Arial, Helvetica, sans-serif" font-size="14.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">API Gateway (FastAPI)</text>
+<text x="430" y="72.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">— OpenAI-compatible, streaming</text>
+<rect x="259" y="86" width="162.0" height="28" rx="4" fill="#f2f4f7" stroke="#9aa3ad" stroke-width="1"/>
+<text x="340.0" y="105.0" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="middle">/v1/chat/completions</text>
+<rect x="430.0" y="86" width="74.0" height="28" rx="4" fill="#f2f4f7" stroke="#9aa3ad" stroke-width="1"/>
+<text x="467.0" y="105.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="middle">JWT auth</text>
+<rect x="513.0" y="86" width="106.5" height="28" rx="4" fill="#f2f4f7" stroke="#9aa3ad" stroke-width="1"/>
+<text x="566.25" y="105.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="middle">session store</text>
+<rect x="628.5" y="86" width="158.5" height="28" rx="4" fill="#f2f4f7" stroke="#9aa3ad" stroke-width="1"/>
+<text x="707.75" y="105.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="middle">async document ingest</text>
+<rect x="796.0" y="86" width="158.5" height="28" rx="4" fill="#f2f4f7" stroke="#9aa3ad" stroke-width="1"/>
+<text x="875.25" y="105.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="middle">cluster control plane</text>
+<rect x="247" y="142" width="738" height="608" rx="8" fill="#eef3f9" stroke="#2f5d8a" stroke-width="1.4" stroke-dasharray="7,4"/>
+<text x="282" y="166.0" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="bold" font-style="normal" fill="#2f5d8a" text-anchor="start">ReAct Agent Loop</text>
+<text x="431" y="166.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">single reasoning–acting loop, iteration t = 1 … N</text>
+<rect x="280" y="250" width="160" height="120" rx="6" fill="#fff" stroke="#3a3a3a" stroke-width="1.3"/>
+<text x="292" y="272.0" font-family="Arial, Helvetica, sans-serif" font-size="14.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Context Manager</text>
+<text x="292" y="292.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">micro-compaction of</text>
+<text x="292" y="308.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">old iterations;</text>
+<text x="292" y="324.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">auto-compact on</text>
+<text x="292" y="340.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">context overflow</text>
+<rect x="470" y="250" width="170" height="120" rx="6" fill="#fff" stroke="#3a3a3a" stroke-width="1.3"/>
+<rect x="470" y="250" width="5" height="120" fill="#7a4f8f" rx="2"/>
+<rect x="482" y="258" width="103.76" height="20" rx="3" fill="#7a4f8f" stroke="#7a4f8f" stroke-width="1"/>
+<text x="533.88" y="272.5" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="bold" font-style="normal" fill="#fff" text-anchor="middle">OBSERVATION</text>
+<text x="482" y="296.0" font-family="Arial, Helvetica, sans-serif" font-size="14.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Result Formatting</text>
+<text x="482" y="316.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">normalize output;</text>
+<text x="482" y="332.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">spill oversize result</text>
+<text x="482" y="348.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">to disk (pointer kept)</text>
+<rect x="672" y="186" width="298" height="252" rx="6" fill="#fff" stroke="#3a3a3a" stroke-width="1.3"/>
+<rect x="672" y="186" width="5" height="252" fill="#2f7a45" rx="2"/>
+<rect x="684" y="194" width="62.96" height="20" rx="3" fill="#2f7a45" stroke="#2f7a45" stroke-width="1"/>
+<text x="715.48" y="208.5" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="bold" font-style="normal" fill="#fff" text-anchor="middle">ACTION</text>
+<text x="684" y="232.0" font-family="Arial, Helvetica, sans-serif" font-size="14.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Tool Dispatch</text>
+<text x="684" y="251.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">capability-aware segmented scheduling</text>
+<rect x="688" y="278" width="100" height="24" rx="4" fill="#fff" stroke="#8a8a8a" stroke-width="1"/>
+<circle cx="699" cy="290.0" r="4.2" fill="#2f7a45"/>
+<text x="710" y="294.2" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="12" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">file_reader</text>
+<rect x="688" y="309" width="100" height="24" rx="4" fill="#fff" stroke="#8a8a8a" stroke-width="1"/>
+<circle cx="699" cy="321.0" r="4.2" fill="#2f7a45"/>
+<text x="710" y="325.2" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="12" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">grep</text>
+<rect x="688" y="340" width="100" height="24" rx="4" fill="#fff" stroke="#8a8a8a" stroke-width="1"/>
+<circle cx="699" cy="352.0" r="4.2" fill="#2f7a45"/>
+<text x="710" y="356.2" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="12" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">rag</text>
+<path d="M792,278 h5 v86 h-5" fill="none" stroke="#4d4d4d" stroke-width="1.2"/>
+<path d="M800,321 H812" fill="none" stroke="#3a3a3a" stroke-width="1.3" marker-end="url(#ah-k)"/>
+<rect x="814" y="309" width="88" height="24" rx="4" fill="#fff" stroke="#8a8a8a" stroke-width="1"/>
+<rect x="821" y="317.0" width="8" height="8" fill="#3a3a3a"/>
+<text x="836" y="325.2" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="12" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">file_edit</text>
+<path d="M904,321 H914" fill="none" stroke="#3a3a3a" stroke-width="1.3" marker-end="url(#ah-k)"/>
+<rect x="916" y="294" width="50" height="24" rx="4" fill="#fff" stroke="#8a8a8a" stroke-width="1"/>
+<circle cx="927" cy="306.0" r="4.2" fill="#2f7a45"/>
+<text x="938" y="310.2" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="12" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">grep</text>
+<rect x="916" y="325" width="50" height="24" rx="4" fill="#fff" stroke="#8a8a8a" stroke-width="1"/>
+<circle cx="927" cy="337.0" r="4.2" fill="#2f7a45"/>
+<text x="938" y="341.2" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="12" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">rag</text>
+<text x="738" y="386.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="bold" font-style="normal" fill="#2f7a45" text-anchor="middle">parallel</text>
+<text x="858" y="386.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="middle">serial barrier</text>
+<text x="941" y="386.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="bold" font-style="normal" fill="#2f7a45" text-anchor="middle">parallel</text>
+<text x="684" y="408.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">read-only calls start mid-stream as soon</text>
+<text x="684" y="423.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">as their arguments are parsed</text>
+<rect x="280" y="532" width="160" height="106" rx="6" fill="#fff" stroke="#3a3a3a" stroke-width="1.3"/>
+<text x="292" y="554.0" font-family="Arial, Helvetica, sans-serif" font-size="14.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Context Assembly</text>
+<text x="292" y="574.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">cached system prompt</text>
+<text x="292" y="590.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">+ workspace, env,</text>
+<text x="292" y="606.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">RAG collections</text>
+<rect x="470" y="532" width="170" height="106" rx="6" fill="#fff" stroke="#3a3a3a" stroke-width="1.3"/>
+<rect x="470" y="532" width="5" height="106" fill="#2f5d8a" rx="2"/>
+<rect x="482" y="540" width="71.12" height="20" rx="3" fill="#2f5d8a" stroke="#2f5d8a" stroke-width="1"/>
+<text x="517.56" y="554.5" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="bold" font-style="normal" fill="#fff" text-anchor="middle">THOUGHT</text>
+<text x="482" y="578.0" font-family="Arial, Helvetica, sans-serif" font-size="14.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">LLM Reasoning</text>
+<text x="482" y="598.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">streamed decoding;</text>
+<text x="482" y="614.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">tool-call parsing</text>
+<polygon points="712,541 756,585 712,629 668,585" fill="#fff" stroke="#3a3a3a" stroke-width="1.3"/>
+<text x="712" y="581.6" font-family="Arial, Helvetica, sans-serif" font-size="13.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="middle">Tool</text>
+<text x="712" y="597.8" font-family="Arial, Helvetica, sans-serif" font-size="13.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="middle">call(s)?</text>
+<polygon points="828,541 872,585 828,629 784,585" fill="#fff" stroke="#3a3a3a" stroke-width="1.3"/>
+<text x="828" y="581.9" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="middle">Done-</text>
+<text x="828" y="596.9" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="middle">gate?</text>
+<rect x="900" y="561" width="70" height="48" rx="24.0" fill="#fff" stroke="#3a3a3a" stroke-width="1.3"/>
+<text x="935.0" y="581.8" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="middle">Final</text>
+<text x="935.0" y="597.4" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="middle">Answer</text>
+<path d="M262,128 V585 H280" fill="none" stroke="#3a3a3a" stroke-width="1.5" marker-end="url(#ah-k)"/>
+<text x="268" y="520.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">request</text>
+<path d="M440,585 H470" fill="none" stroke="#3a3a3a" stroke-width="1.5" marker-end="url(#ah-k)"/>
+<path d="M640,585 H668" fill="none" stroke="#3a3a3a" stroke-width="1.5" marker-end="url(#ah-k)"/>
+<path d="M712,541 V438" fill="none" stroke="#3a3a3a" stroke-width="1.5" marker-end="url(#ah-k)"/>
+<text x="718" y="527.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="bold" font-style="normal" fill="#2f7a45" text-anchor="start">Yes</text>
+<path d="M756,585 H784" fill="none" stroke="#3a3a3a" stroke-width="1.5" marker-end="url(#ah-k)"/>
+<text x="761" y="578.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">No</text>
+<path d="M872,585 H900" fill="none" stroke="#3a3a3a" stroke-width="1.5" marker-end="url(#ah-k)"/>
+<text x="875" y="578.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Yes</text>
+<path d="M672,310 H640" fill="none" stroke="#3a3a3a" stroke-width="1.5" marker-end="url(#ah-k)"/>
+<path d="M470,310 H440" fill="none" stroke="#3a3a3a" stroke-width="1.5" marker-end="url(#ah-k)"/>
+<path d="M360,370 V532" fill="none" stroke="#3a3a3a" stroke-width="1.5" marker-end="url(#ah-k)"/>
+<path d="M828,629 V690 H600 V638" fill="none" stroke="#3a3a3a" stroke-width="1.5" marker-end="url(#ah-k)"/>
+<text x="822" y="706.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="end">No: open to-dos remain → re-enter loop (goal mode)</text>
+<text x="832" y="663.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">No</text>
+<path d="M590,452 A34,34 0 1 1 556,418" fill="none" stroke="#2f5d8a" stroke-width="2" marker-end="url(#ah-k)"/>
+<text x="556" y="450.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="bold" font-style="normal" fill="#2f5d8a" text-anchor="middle">ReAct</text>
+<text x="556" y="465.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="normal" font-style="normal" fill="#2f5d8a" text-anchor="middle">cycle</text>
+<rect x="280" y="656" width="205" height="76" rx="6" fill="#fff" stroke="#8a8a8a" stroke-width="1" stroke-dasharray="4,3"/>
+<text x="292" y="676.0" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Loop safeguards</text>
+<text x="292" y="694.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">iteration budget · stop signal</text>
+<text x="292" y="709.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">repeat-call / failure detection</text>
+<rect x="1017" y="15" width="468" height="745" rx="8" fill="#f4f8f3" stroke="#555" stroke-width="1.4"/>
+<circle cx="1037" cy="35" r="11" fill="#1b1b1b"/>
+<text x="1037" y="40.0" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="bold" font-style="normal" fill="#fff" text-anchor="middle">C</text>
+<text x="1055" y="41.0" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Tool Library</text>
+<text x="1177" y="41.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">15 tools via JSON-schema function calling</text>
+<rect x="1031" y="62" width="440" height="119" rx="6" fill="#fff" stroke="#3a3a3a" stroke-width="1.2"/>
+<rect x="1031" y="62" width="5" height="119" fill="#2f7a45" rx="2"/>
+<text x="1045" y="83.0" font-family="Arial, Helvetica, sans-serif" font-size="14.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Knowledge Retrieval</text>
+<rect x="1045" y="93" width="134" height="25" rx="4" fill="#fff" stroke="#8a8a8a" stroke-width="1"/>
+<circle cx="1056" cy="105.5" r="4.2" fill="#2f7a45"/>
+<text x="1067" y="110.0" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">rag</text>
+<rect x="1187" y="93" width="134" height="25" rx="4" fill="#fff" stroke="#8a8a8a" stroke-width="1"/>
+<circle cx="1198" cy="105.5" r="4.2" fill="#2f7a45"/>
+<text x="1209" y="110.0" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">websearch</text>
+<text x="1045" y="136.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">hybrid search: FAISS (dense) + BM25 → RRF</text>
+<text x="1045" y="152.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">fusion → cross-encoder re-ranking</text>
+<text x="1045" y="170.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="italic" fill="#2f7a45" text-anchor="start">▸ document QA · literature review · grounded answers</text>
+<rect x="1031" y="191" width="440" height="118" rx="6" fill="#fff" stroke="#3a3a3a" stroke-width="1.2"/>
+<rect x="1031" y="191" width="5" height="118" fill="#2f7a45" rx="2"/>
+<text x="1045" y="212.0" font-family="Arial, Helvetica, sans-serif" font-size="14.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Code &amp; Computation</text>
+<rect x="1045" y="222" width="134" height="25" rx="4" fill="#fff" stroke="#8a8a8a" stroke-width="1"/>
+<rect x="1052" y="230.5" width="8" height="8" fill="#3a3a3a"/>
+<text x="1067" y="239.1" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">code_exec</text>
+<rect x="1187" y="222" width="134" height="25" rx="4" fill="#fff" stroke="#8a8a8a" stroke-width="1"/>
+<rect x="1194" y="230.5" width="8" height="8" fill="#3a3a3a"/>
+<text x="1209" y="239.1" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">shell_exec</text>
+<rect x="1329" y="222" width="134" height="25" rx="4" fill="#fff" stroke="#8a8a8a" stroke-width="1"/>
+<circle cx="1340" cy="234.5" r="4.2" fill="#2f7a45"/>
+<text x="1351" y="239.1" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">shell_lint</text>
+<rect x="1045" y="253" width="134" height="25" rx="4" fill="#fff" stroke="#8a8a8a" stroke-width="1"/>
+<rect x="1052" y="261.5" width="8" height="8" fill="#3a3a3a"/>
+<text x="1067" y="270.1" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">process_monitor</text>
+<text x="1045" y="298.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="italic" fill="#2f7a45" text-anchor="start">▸ data analysis · simulation · plotting · automation</text>
+<rect x="1031" y="319" width="440" height="118" rx="6" fill="#fff" stroke="#3a3a3a" stroke-width="1.2"/>
+<rect x="1031" y="319" width="5" height="118" fill="#2f7a45" rx="2"/>
+<text x="1045" y="340.0" font-family="Arial, Helvetica, sans-serif" font-size="14.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">File System &amp; Software Engineering</text>
+<rect x="1045" y="350" width="134" height="25" rx="4" fill="#fff" stroke="#8a8a8a" stroke-width="1"/>
+<circle cx="1056" cy="362.5" r="4.2" fill="#2f7a45"/>
+<text x="1067" y="367.1" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">file_reader</text>
+<rect x="1187" y="350" width="134" height="25" rx="4" fill="#fff" stroke="#8a8a8a" stroke-width="1"/>
+<circle cx="1198" cy="362.5" r="4.2" fill="#2f7a45"/>
+<text x="1209" y="367.1" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">file_navigator</text>
+<rect x="1329" y="350" width="134" height="25" rx="4" fill="#fff" stroke="#8a8a8a" stroke-width="1"/>
+<circle cx="1340" cy="362.5" r="4.2" fill="#2f7a45"/>
+<text x="1351" y="367.1" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">grep</text>
+<rect x="1045" y="381" width="134" height="25" rx="4" fill="#fff" stroke="#8a8a8a" stroke-width="1"/>
+<rect x="1052" y="389.5" width="8" height="8" fill="#3a3a3a"/>
+<text x="1067" y="398.1" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">file_edit</text>
+<rect x="1187" y="381" width="134" height="25" rx="4" fill="#fff" stroke="#8a8a8a" stroke-width="1"/>
+<rect x="1194" y="389.5" width="8" height="8" fill="#3a3a3a"/>
+<text x="1209" y="398.1" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">apply_patch</text>
+<rect x="1329" y="381" width="134" height="25" rx="4" fill="#fff" stroke="#8a8a8a" stroke-width="1"/>
+<rect x="1336" y="389.5" width="8" height="8" fill="#3a3a3a"/>
+<text x="1351" y="398.1" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">file_writer</text>
+<text x="1045" y="426.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="italic" fill="#2f7a45" text-anchor="start">▸ codebase understanding · autonomous editing · reports</text>
+<rect x="1031" y="447" width="440" height="103" rx="6" fill="#fff" stroke="#3a3a3a" stroke-width="1.2"/>
+<rect x="1031" y="447" width="5" height="103" fill="#2f7a45" rx="2"/>
+<text x="1045" y="468.0" font-family="Arial, Helvetica, sans-serif" font-size="14.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Planning &amp; Memory</text>
+<rect x="1045" y="478" width="134" height="25" rx="4" fill="#fff" stroke="#8a8a8a" stroke-width="1"/>
+<rect x="1052" y="486.5" width="8" height="8" fill="#3a3a3a"/>
+<text x="1067" y="495.1" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">todo_write</text>
+<rect x="1187" y="478" width="134" height="25" rx="4" fill="#fff" stroke="#8a8a8a" stroke-width="1"/>
+<rect x="1194" y="486.5" width="8" height="8" fill="#3a3a3a"/>
+<text x="1209" y="495.1" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">memo</text>
+<text x="1045" y="521.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">task checklist · persistent key–value memory</text>
+<text x="1045" y="539.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="italic" fill="#2f7a45" text-anchor="start">▸ multi-step goal execution · cross-session recall</text>
+<rect x="1031" y="560" width="440" height="119" rx="6" fill="#fff" stroke="#3a3a3a" stroke-width="1.2"/>
+<rect x="1031" y="560" width="5" height="119" fill="#2f7a45" rx="2"/>
+<text x="1045" y="581.0" font-family="Arial, Helvetica, sans-serif" font-size="14.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Delegation</text>
+<rect x="1045" y="591" width="134" height="25" rx="4" fill="#fff" stroke="#8a8a8a" stroke-width="1"/>
+<circle cx="1056" cy="603.5" r="4.2" fill="#2f7a45"/>
+<text x="1067" y="608.0" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">agent</text>
+<text x="1045" y="634.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">spawns a sub-agent (read-only explore or general)</text>
+<text x="1045" y="650.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">running a nested ReAct loop in a fresh context</text>
+<text x="1045" y="668.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="italic" fill="#2f7a45" text-anchor="start">▸ task decomposition · parallel investigation</text>
+<circle cx="1049" cy="701" r="4.2" fill="#2f7a45"/>
+<text x="1059" y="706.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">concurrency-safe (parallel)</text>
+<rect x="1249" y="697" width="8" height="8" fill="#3a3a3a"/>
+<text x="1263" y="706.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">mutating (serial barrier)</text>
+<path d="M970,300 H1017" fill="none" stroke="#2f7a45" stroke-width="2" marker-end="url(#ah-g)" marker-start="url(#as-g)"/>
+<rect x="15" y="778" width="985" height="267" rx="8" fill="#fcf5ec" stroke="#555" stroke-width="1.4"/>
+<circle cx="35" cy="798" r="11" fill="#1b1b1b"/>
+<text x="35" y="803.0" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="bold" font-style="normal" fill="#fff" text-anchor="middle">D</text>
+<text x="53" y="804.0" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Local Inference Layer (on-premise)</text>
+<rect x="30" y="815" width="690" height="66" rx="6" fill="#fff" stroke="#b5651d" stroke-width="1.4"/>
+<text x="44" y="836.0" font-family="Arial, Helvetica, sans-serif" font-size="14.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Inference Engine — vLLM</text>
+<text x="300" y="836.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">OpenAI-compatible serving · continuous batching · prefix (KV) caching</text>
+<text x="300" y="852.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">tool-call parser · reasoning parser</text>
+<rect x="30" y="889" width="690" height="52" rx="6" fill="#fff" stroke="#b5651d" stroke-width="1.4"/>
+<text x="44" y="910.0" font-family="Arial, Helvetica, sans-serif" font-size="14.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Open-weight LLM (swappable)</text>
+<text x="300" y="910.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">e.g., GLM · Qwen · Llama · Mistral · DeepSeek</text>
+<rect x="30" y="949" width="690" height="52" rx="6" fill="#fff" stroke="#b5651d" stroke-width="1.4"/>
+<text x="44" y="970.0" font-family="Arial, Helvetica, sans-serif" font-size="14.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">On-premise GPU Server(s)</text>
+<text x="300" y="970.0" font-family="Arial, Helvetica, sans-serif" font-size="12.5" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="start">single node, or master + N worker nodes (cluster)</text>
+<rect x="740" y="815" width="245" height="186" rx="6" fill="#fff" stroke="#b5651d" stroke-width="1.4"/>
+<text x="754" y="838.0" font-family="Arial, Helvetica, sans-serif" font-size="14.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Deployment properties</text>
+<text x="756" y="864.0" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="bold" font-style="normal" fill="#b5651d" text-anchor="start">✓</text>
+<text x="776" y="864.0" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">air-gapped operation</text>
+<text x="756" y="890.0" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="bold" font-style="normal" fill="#b5651d" text-anchor="start">✓</text>
+<text x="776" y="890.0" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">data never leaves premises</text>
+<text x="756" y="916.0" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="bold" font-style="normal" fill="#b5651d" text-anchor="start">✓</text>
+<text x="776" y="916.0" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">no per-token API cost</text>
+<text x="756" y="942.0" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="bold" font-style="normal" fill="#b5651d" text-anchor="start">✓</text>
+<text x="776" y="942.0" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">model-agnostic backend</text>
+<text x="756" y="968.0" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="bold" font-style="normal" fill="#b5651d" text-anchor="start">✓</text>
+<text x="776" y="968.0" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#1b1b1b" text-anchor="start">horizontal scale-out</text>
+<text x="30" y="1030.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="normal" font-style="italic" fill="#4d4d4d" text-anchor="start">The agent requires only an OpenAI-compatible local endpoint: replacing the model changes no agent or tool code.</text>
+<path d="M510,638 V815" fill="none" stroke="#b5651d" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#ah-o)" marker-start="url(#as-o)"/>
+<text x="518" y="728.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="bold" font-style="normal" fill="#b5651d" text-anchor="start">prompt + tool schemas  ↓</text>
+<text x="518" y="743.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="bold" font-style="normal" fill="#b5651d" text-anchor="start">token stream  ↑</text>
+<rect x="1017" y="778" width="468" height="267" rx="8" fill="#f6f6f6" stroke="#555" stroke-width="1.4"/>
+<circle cx="1037" cy="798" r="11" fill="#1b1b1b"/>
+<text x="1037" y="803.0" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="bold" font-style="normal" fill="#fff" text-anchor="middle">E</text>
+<text x="1055" y="804.0" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="start">Persistent State</text>
+<path d="M1044.0,838 v58 a31.0,7 0 0 0 62,0 v-58" fill="#fff" stroke="#3a3a3a" stroke-width="1.2"/>
+<ellipse cx="1075.0" cy="838" rx="31.0" ry="7" fill="#fff" stroke="#3a3a3a" stroke-width="1.2"/>
+<text x="1075.0" y="930.0" font-family="Arial, Helvetica, sans-serif" font-size="13.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="middle">Sessions</text>
+<text x="1075.0" y="948.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="middle">conversation</text>
+<text x="1075.0" y="963.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="middle">history</text>
+<path d="M1132.0,838 v58 a31.0,7 0 0 0 62,0 v-58" fill="#fff" stroke="#3a3a3a" stroke-width="1.2"/>
+<ellipse cx="1163.0" cy="838" rx="31.0" ry="7" fill="#fff" stroke="#3a3a3a" stroke-width="1.2"/>
+<text x="1163.0" y="930.0" font-family="Arial, Helvetica, sans-serif" font-size="13.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="middle">Vector</text>
+<text x="1163.0" y="948.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="middle">FAISS + BM25</text>
+<text x="1163.0" y="963.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="middle">index</text>
+<path d="M1220.0,838 v58 a31.0,7 0 0 0 62,0 v-58" fill="#fff" stroke="#3a3a3a" stroke-width="1.2"/>
+<ellipse cx="1251.0" cy="838" rx="31.0" ry="7" fill="#fff" stroke="#3a3a3a" stroke-width="1.2"/>
+<text x="1251.0" y="930.0" font-family="Arial, Helvetica, sans-serif" font-size="13.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="middle">Memory</text>
+<text x="1251.0" y="948.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="middle">memo</text>
+<text x="1251.0" y="963.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="middle">store</text>
+<path d="M1308.0,838 v58 a31.0,7 0 0 0 62,0 v-58" fill="#fff" stroke="#3a3a3a" stroke-width="1.2"/>
+<ellipse cx="1339.0" cy="838" rx="31.0" ry="7" fill="#fff" stroke="#3a3a3a" stroke-width="1.2"/>
+<text x="1339.0" y="930.0" font-family="Arial, Helvetica, sans-serif" font-size="13.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="middle">Spill</text>
+<text x="1339.0" y="948.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="middle">offloaded</text>
+<text x="1339.0" y="963.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="middle">tool output</text>
+<path d="M1396.0,838 v58 a31.0,7 0 0 0 62,0 v-58" fill="#fff" stroke="#3a3a3a" stroke-width="1.2"/>
+<ellipse cx="1427.0" cy="838" rx="31.0" ry="7" fill="#fff" stroke="#3a3a3a" stroke-width="1.2"/>
+<text x="1427.0" y="930.0" font-family="Arial, Helvetica, sans-serif" font-size="13.5" font-weight="bold" font-style="normal" fill="#1b1b1b" text-anchor="middle">Jobs &amp; Logs</text>
+<text x="1427.0" y="948.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="middle">async ingest,</text>
+<text x="1427.0" y="963.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="normal" font-style="normal" fill="#4d4d4d" text-anchor="middle">audit trail</text>
+<text x="1035" y="1000.0" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="normal" font-style="italic" fill="#4d4d4d" text-anchor="start">tools read / write state; sessions resume across restarts</text>
+</svg>

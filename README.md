@@ -1,8 +1,8 @@
-# 🧠 Huni — Self-Hosted, Multi-Node AI Platform
+# 🧠 Agentic LLM API Server — Self-Hosted, Multi-Node AI Platform
 
 **One repository. One config file. A whole private AI cluster.**
 
-Huni is a fully self-hosted, **air-gap-ready** AI platform that turns a fleet of
+**Agentic LLM API Server** is a fully self-hosted, **air-gap-ready** AI platform that turns a fleet of
 LAN machines into a single, coordinated agentic system — reachable through a
 built-in **team Messenger** with a real chat UI, embedded coding terminals, and
 a chat bot that can delegate work across every node in the cluster.
@@ -31,7 +31,7 @@ models, you own the data.
 
 ---
 
-## ✨ Why Huni
+## ✨ Why Agentic LLM API Server
 
 | | |
 |---|---|
@@ -199,7 +199,7 @@ Key endpoints: `POST /v1/chat/completions` · `GET /v1/models` · `POST /login`
 
 ## 📚 Retrieval-Augmented Generation (RAG)
 
-Bring your own documents. Huni ingests them, indexes them, and lets the agent
+Bring your own documents. The server ingests them, indexes them, and lets the agent
 cite them — all locally, with pluggable embedding and reranker models.
 
 ```mermaid
@@ -292,7 +292,7 @@ flowchart TB
 
 ## 🌐 Multi-Node Control & Delegation
 
-This is Huni's signature capability: **the whole cluster behaves like one AI you
+This is the platform's signature capability: **the whole cluster behaves like one AI you
 talk to in chat.** Slaves auto-register with the master's control plane, send
 heartbeats, and claim delegated tasks. From any Messenger room you address the
 fleet with simple directives.
