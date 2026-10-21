@@ -272,7 +272,7 @@ DATABASE_PATH = str(DATA_DIR / "app.db")
 # ============================================================================
 # Authentication Settings
 # ============================================================================
-JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "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")
+JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "change-this-jwt-secret-in-production")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24 * 7
 
