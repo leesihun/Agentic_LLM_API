@@ -64,6 +64,10 @@ VLLM_SERVER_URL = "http://10.228.69.135:10000"
 # vLLM reply 404 "model does not exist". Discover the exact name with:
 #     curl http://127.0.0.1:10000/v1/models
 VLLM_MODEL = "GLM-5.2"
+# MODEL_CONTEXT_WINDOW: vLLM's --max-model-len (max prompt + output tokens
+# per request). Keep it equal to the launch flag. llm-api derives its compaction
+# trigger and token budgets from this; 0 = auto-detect from vLLM /v1/models.
+MODEL_CONTEXT_WINDOW = 200_000
 
 # ─── Service ports ──────────────────────────────────────────────────────────
 MESSENGER_PORT = 10006

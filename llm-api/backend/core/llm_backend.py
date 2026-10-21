@@ -366,6 +366,32 @@ class VllmBackend:
     # Request payload
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _fit_max_tokens(
+        max_tokens: int,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+    ) -> int:
+        """Clamp max_tokens so prompt + output fits the served context window.
+
+        vLLM rejects a request unless prompt_tokens + max_tokens <= max_model_len.
+        The configured max_tokens is only a ceiling; this shrinks it to the room
+        actually left (window - estimated prompt - safety margin), so a large
+        output ceiling never forces a small prompt budget. The prompt estimate is
+        deliberately conservative (JSON bytes // 3, tool schemas included), and it
+        is recomputed per call, so a retry after auto-compaction gets the larger
+        room back. No-op when the window is unknown (MODEL_CONTEXT_WINDOW <= 0).
+        """
+        window = int(getattr(config, "MODEL_CONTEXT_WINDOW", 0) or 0)
+        if window <= 0:
+            return max_tokens
+        prompt_bytes = len(json.dumps(messages, ensure_ascii=False, default=str).encode("utf-8"))
+        if tools:
+            prompt_bytes += len(json.dumps(tools, ensure_ascii=False, default=str).encode("utf-8"))
+        room = window - prompt_bytes // 3 - int(getattr(config, "MAX_TOKENS_SAFETY_MARGIN", 2048))
+        floor = int(getattr(config, "MIN_OUTPUT_TOKENS", 1024))
+        return max(floor, min(max_tokens, room))
+
     def _build_payload(
         self,
         messages: List[Dict[str, Any]],
@@ -408,7 +434,7 @@ class VllmBackend:
         if min_p is not None:
             payload["min_p"] = min_p
         if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
+            payload["max_tokens"] = self._fit_max_tokens(max_tokens, messages, tools)
         if repetition_penalty is not None:
             payload["repetition_penalty"] = repetition_penalty
         # Structured / guided decoding (vLLM): constrain output to a JSON schema

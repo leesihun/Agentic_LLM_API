@@ -173,7 +173,7 @@ MEMORY_FLUSH_THRESHOLD = 30
 # Token budget for the room-history snapshot forwarded with a cluster
 # delegation (@node). Kept in step with llm-api's MAX_CONVERSATION_TOKENS so
 # the recent-context limit is uniform across the stack.
-MAX_CONVERSATION_TOKENS = 200_000
+MAX_CONVERSATION_TOKENS = 80_000
 # Stream LLM responses with live tool-status updates.
 STREAMING_ENABLED = True
 

@@ -98,17 +98,22 @@ CLUSTER_TASKS_CLEANUP_DAYS = int(getattr(_CLUSTER, "CLUSTER_TASKS_CLEANUP_DAYS",
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_TOP_P = 0.95
 DEFAULT_TOP_K = 40
-# GLM-5.2's published sampling floor is min_p=0.01. The previous 0.1 was ~10x
-# too aggressive and clipped valid tail tokens (worse with temperature=1.0).
-DEFAULT_MIN_P = 0.01
+# min_p=0.0 disables min-p filtering (top_p/top_k still apply). GLM-5.2's
+# published floor is 0.01; the earlier 0.1 clipped valid tail tokens.
+DEFAULT_MIN_P = 0.0
 # Per-turn OUTPUT token ceiling. On a reasoning model at high/max effort the
 # hidden <think> block alone can eat thousands of tokens, so a small cap here
 # truncates the turn mid-thought or mid-tool-call (the call is then suppressed —
 # see llm_backend _extract_leaked_tool_calls — and the turn silently ends). The
-# served model is long-context (~1M), so keep generous headroom. vLLM allocates
+# served model window is 200k, so keep headroom. vLLM allocates
 # KV incrementally, so a high ceiling costs nothing unless actually generated;
 # it only needs prompt_tokens + max_tokens <= the served model's max_model_len.
 DEFAULT_MAX_TOKENS = 100000
+# max_tokens above is only a ceiling: llm_backend._fit_max_tokens shrinks it per
+# request to (MODEL_CONTEXT_WINDOW - estimated prompt - margin), so a big output
+# ceiling does not reduce how much prompt can be sent. Floor = never request less.
+MAX_TOKENS_SAFETY_MARGIN = 2048
+MIN_OUTPUT_TOKENS = 1024
 DEFAULT_REPETITION_PENALTY = 1.0   # vLLM's field is `repetition_penalty` (1.0 = no penalty)
 
 # Per-model temperature overrides (substring match on model name, lowercase).
@@ -206,10 +211,14 @@ AGENT_COMPACTION_WARM_WINDOW = 10  # multi-file edit flows need more headroom th
 # stream_options.include_usage) and the last call's prompt crossed
 # MODEL_CONTEXT_WINDOW * AGENT_COMPACT_AT_TOKEN_FRACTION, the agent summarizes
 # the older half BEFORE the next send — avoiding the reactive 400-then-resend.
-# MODEL_CONTEXT_WINDOW = 0 disables proactive compaction (reactive still works).
-# Set this to your served model's max context length (see vLLM --max-model-len).
+# MODEL_CONTEXT_WINDOW comes from cluster_config.py (= vLLM --max-model-len, 200k);
+# 0 means auto-detect from vLLM at startup.
+# vLLM rejects a request unless prompt_tokens + max_tokens <= max_model_len, so the
+# trigger must fire while there is still room for one more iteration's growth:
+#   200k window, 100k output ceiling: compact at 100k prompt (0.5) so the full
+# ceiling still fits; past that _fit_max_tokens trims the output ceiling to fit.
 MODEL_CONTEXT_WINDOW = int(os.environ.get("MODEL_CONTEXT_WINDOW", getattr(_CLUSTER, "MODEL_CONTEXT_WINDOW", 0)))
-AGENT_COMPACT_AT_TOKEN_FRACTION = 0.75
+AGENT_COMPACT_AT_TOKEN_FRACTION = 0.5
 
 # Auto-compact: also triggered reactively when vLLM returns a context-overflow
 # error. We summarize the older half of the conversation via a single LLM call
@@ -440,7 +449,7 @@ MAX_CONVERSATION_HISTORY = 200
 # Hard cap on the recent conversation fed to the LLM, in estimated tokens.
 # Applied alongside MAX_CONVERSATION_HISTORY (whichever is more restrictive) so
 # the hot context never exceeds this budget regardless of message count.
-MAX_CONVERSATION_TOKENS = 200_000
+MAX_CONVERSATION_TOKENS = 80_000  # under the 100k compaction trigger, leaving ~20k for system prompt + tool growth
 SESSIONS_DIR = DATA_DIR / "sessions"
 SESSION_CLEANUP_DAYS = 7
 
