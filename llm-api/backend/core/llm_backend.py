@@ -366,8 +366,24 @@ class VllmBackend:
     # Request payload
     # ------------------------------------------------------------------
 
+    # Corrections learned from vLLM's own context-overflow 400s (see chat_stream):
+    # the real max_model_len, and how much our byte-based prompt estimate undercounts.
+    _learned_window: int = 0
+    _prompt_scale: float = 1.0
+
     @staticmethod
+    def _estimate_prompt_tokens(
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+    ) -> int:
+        """Conservative raw prompt estimate: JSON bytes // 3, tool schemas included."""
+        nbytes = len(json.dumps(messages, ensure_ascii=False, default=str).encode("utf-8"))
+        if tools:
+            nbytes += len(json.dumps(tools, ensure_ascii=False, default=str).encode("utf-8"))
+        return nbytes // 3
+
     def _fit_max_tokens(
+        self,
         max_tokens: int,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]],
@@ -377,20 +393,39 @@ class VllmBackend:
         vLLM rejects a request unless prompt_tokens + max_tokens <= max_model_len.
         The configured max_tokens is only a ceiling; this shrinks it to the room
         actually left (window - estimated prompt - safety margin), so a large
-        output ceiling never forces a small prompt budget. The prompt estimate is
-        deliberately conservative (JSON bytes // 3, tool schemas included), and it
-        is recomputed per call, so a retry after auto-compaction gets the larger
-        room back. No-op when the window is unknown (MODEL_CONTEXT_WINDOW <= 0).
+        output ceiling never forces a small prompt budget. Recomputed per call,
+        so a retry after auto-compaction gets the larger room back. The window is
+        MODEL_CONTEXT_WINDOW, tightened to whatever vLLM last reported; no-op
+        while the window is unknown (<= 0).
         """
         window = int(getattr(config, "MODEL_CONTEXT_WINDOW", 0) or 0)
+        if self._learned_window:
+            window = min(window, self._learned_window) if window > 0 else self._learned_window
         if window <= 0:
             return max_tokens
-        prompt_bytes = len(json.dumps(messages, ensure_ascii=False, default=str).encode("utf-8"))
-        if tools:
-            prompt_bytes += len(json.dumps(tools, ensure_ascii=False, default=str).encode("utf-8"))
-        room = window - prompt_bytes // 3 - int(getattr(config, "MAX_TOKENS_SAFETY_MARGIN", 2048))
+        prompt_est = int(self._estimate_prompt_tokens(messages, tools) * self._prompt_scale)
+        room = window - prompt_est - int(getattr(config, "MAX_TOKENS_SAFETY_MARGIN", 2048))
         floor = int(getattr(config, "MIN_OUTPUT_TOKENS", 1024))
         return max(floor, min(max_tokens, room))
+
+    @staticmethod
+    def _parse_context_overflow(body: str) -> Optional[tuple]:
+        """Extract (max_model_len, prompt_tokens) from a vLLM context-overflow 400.
+
+        Handles both wordings vLLM has used: "maximum context length is L tokens
+        ... N tokens in the input messages / (N in the messages, ...)" and
+        "You passed N input tokens ... context length is only L tokens".
+        Returns None when the body is not a recognizable overflow message.
+        """
+        m_limit = re.search(r"context length is (?:only )?(\d+)", body)
+        m_prompt = (
+            re.search(r"(\d+) tokens in the input messages", body)
+            or re.search(r"\((\d+) in the messages", body)
+            or re.search(r"passed (\d+) input tokens", body)
+        )
+        if not (m_limit and m_prompt):
+            return None
+        return int(m_limit.group(1)), int(m_prompt.group(1))
 
     def _build_payload(
         self,
@@ -455,11 +490,47 @@ class VllmBackend:
             payload["chat_template_kwargs"] = effective_ctk
         return payload
 
+    async def chat_stream(self, *args, **kwargs) -> AsyncIterator[StreamEvent]:
+        """_chat_stream_once with one self-correcting retry on context overflow.
+
+        If vLLM answers 400 because prompt + max_tokens > max_model_len, learn the
+        real window (and how far our prompt estimate undercounts) from its message
+        and retry once with max_tokens reduced to the room that is really left.
+        Only when nothing has been yielded yet and a usable output budget remains;
+        otherwise the error propagates and the agent's auto-compaction handles it.
+        """
+        yielded = False
+        try:
+            async for event in self._chat_stream_once(*args, **kwargs):
+                yielded = True
+                yield event
+            return
+        except httpx.HTTPStatusError as e:
+            parsed = None if yielded else self._parse_context_overflow(str(e))
+            max_tokens = kwargs.get("max_tokens")
+            if parsed is None or not max_tokens:
+                raise
+            limit, prompt_tokens = parsed
+            messages = kwargs.get("messages") if "messages" in kwargs else args[0]
+            est = self._estimate_prompt_tokens(messages, kwargs.get("tools"))
+            if est > 0:
+                self._prompt_scale = max(self._prompt_scale, min(prompt_tokens / est, 3.0))
+            self._learned_window = limit
+            margin = int(getattr(config, "MAX_TOKENS_SAFETY_MARGIN", 2048))
+            room = limit - prompt_tokens - margin
+            if room < int(getattr(config, "MIN_OUTPUT_TOKENS", 1024)):
+                raise  # the prompt alone is too big: compaction, not a smaller output
+            kwargs["max_tokens"] = min(max_tokens, room)
+            print(f"[LLM] Context overflow (window {limit}, prompt {prompt_tokens}): "
+                  f"retrying with max_tokens={kwargs['max_tokens']}")
+        async for event in self._chat_stream_once(*args, **kwargs):
+            yield event
+
     # ------------------------------------------------------------------
     # Streaming chat (with optional tool calling)
     # ------------------------------------------------------------------
 
-    async def chat_stream(
+    async def _chat_stream_once(
         self,
         messages: List[Dict[str, Any]],
         model: str,
