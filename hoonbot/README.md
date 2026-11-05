@@ -28,9 +28,18 @@ On Windows:
 
 **All settings live in `config.py`** — edit it directly.
 
-Prompt files are app-local under `prompts/`: the default files are
+Prompt files are app-local under `prompts/`: the base files are
 `prompts/PROMPT.md` and `prompts/HEARTBEAT.md`, and cluster role profiles live
-in `prompts/master/` and `prompts/slave/`.
+in `prompts/master/` and `prompts/slave/`. The system prompt is **layered**:
+base `PROMPT.md` first, then the profile `PROMPT.md` appended as an overlay
+(`config.load_prompt_text()`; profile rules win on conflict). Heartbeat files
+layer the same way (`config.load_heartbeat_text()`); the heartbeat planner only
+reads the `# Heartbeat Checklist` section, so each profile `HEARTBEAT.md` keeps
+its own complete checklist.
+
+Commonly changed values (node name, ports, heartbeat interval, memory caps,
+follow-up policy) are set in the repo-root `cluster_config.py`; `config.py`
+holds advanced tuning.
 
 | Setting | Default | Purpose |
 |---|---|---|
@@ -42,9 +51,13 @@ in `prompts/master/` and `prompts/slave/`.
 | `MESSENGER_BOT_NAME` | `Bot` | Display name in Messenger |
 | `MESSENGER_HOME_ROOM_NAME` | `Heartbeat` | Room for heartbeat output |
 | `HEARTBEAT_ENABLED` | `True` | Proactive heartbeat task loop |
-| `HEARTBEAT_INTERVAL_SECONDS` | `3000` | Time between heartbeat ticks |
-| `DEBOUNCE_SECONDS` | `1.5` | Combine rapid messages in this window |
-| `LLM_TIMEOUT_SECONDS` | `None` | LLM request read timeout; `None` = no timeout (long tool-heavy turns never cut off) |
+| `HEARTBEAT_INTERVAL_SECONDS` | `3600` (cluster_config) | Time between heartbeat ticks |
+| `DEBOUNCE_SECONDS` | `1.5` | Quiet window that gathers a burst into one queued batch |
+| `FOLLOWUP_POLICY` | `queue` | Messages sent while a turn runs: `queue` for the next turn, or `interrupt` (same-sender follow-ups cancel + merge) |
+| `ROOM_QUEUE_MAX` / `BATCH_MAX_MESSAGES` | `50` / `20` | Per-room queue bound / messages answered per turn |
+| `LLM_TIMEOUT_SECONDS` | `3600` | Wall-clock cap for non-streaming calls; streaming uses the idle watchdog below |
+| `LLM_STREAM_IDLE_TIMEOUT_SECONDS` | `900` | Abort a stream only after this long with no bytes (SSE keepalives count) |
+| `MEMORY_SOFT_CHARS` / `MEMORY_MAX_CHARS` | `8000` / `12000` | memory.md target / hard cap (see Memory below) |
 | `STREAMING_ENABLED` | `True` | Stream LLM responses with live tool status |
 | `SESSION_MAX_AGE_DAYS` | `1` | Sessions older than this reset |
 
@@ -67,7 +80,9 @@ hoonbot/
 ├── deps/
 │   └── requirements.txt
 ├── core/
-│   ├── context.py          System prompt + memory assembler
+│   ├── context.py          System prompt + capped memory view + per-turn context
+│   ├── memory_guard.py     Keeps memory.md under the cap (backup + condense)
+│   ├── fs_snapshot.py      Filesystem map + drift digest (heartbeat)
 │   ├── heartbeat.py        Background proactive task loop
 │   ├── llm_api.py          Async HTTP client for LLM API calls
 │   ├── messenger.py        Messenger REST API client
@@ -76,10 +91,10 @@ hoonbot/
 │   ├── health.py           GET /health
 │   └── webhook.py          POST /webhook (message processing pipeline)
 ├── prompts/
-│   ├── PROMPT.md           System prompt (bot identity + memory instructions)
-│   ├── HEARTBEAT.md        Proactive task checklist (edit to customise)
-│   ├── master/             Master prompt + heartbeat profile
-│   └── slave/              Slave prompt + heartbeat profile
+│   ├── PROMPT.md           Base system prompt (identity, Messenger API, memory rules)
+│   ├── HEARTBEAT.md        Base heartbeat prompt + checklist (edit to customise)
+│   ├── master/             Master overlay prompt + heartbeat profile
+│   └── slave/              Slave overlay prompt + heartbeat profile
 ├── skills/                 Markdown docs for LLM-executed skills
 ├── scripts/
 │   ├── setup_credentials.py  One-time LLM token + model setup
@@ -88,7 +103,9 @@ hoonbot/
 ├── docs/
 │   └── ARCHITECTURE.md
 └── data/                   Runtime state — gitignored
-    ├── memory.md           Persistent LLM memory (Markdown)
+    ├── memory.md           Persistent LLM memory (Markdown, durable facts only)
+    ├── memory_backups/     Copies taken before each condense/reset (last 10)
+    ├── status.md           Live status, overwritten by the heartbeat
     ├── room_sessions.json  Room → session_id map
     ├── .llm_key            LLM API bearer token
     ├── .llm_model          LLM model name
@@ -104,7 +121,8 @@ Messenger UI
 handlers/webhook.py
     ├── validate (text/image/file, not bot, @mention if non-home room)
     ├── mark_read
-    ├── debounce (combine rapid messages)
+    ├── @stop / @clear run immediately; everything else enters the room queue
+    ├── debounce, then take queued messages as one labelled batch
     └── process_message()
             │  POST /v1/chat/completions
             ▼
@@ -123,8 +141,8 @@ python3 scripts/test_llm.py
 # Clear Hoonbot's persistent memory
 python3 scripts/reset.py --memory
 
-# List memory contents
-python3 scripts/reset.py --list-memory
+# Show memory contents (read-only)
+python3 scripts/reset.py --view-memory
 
 # Re-run credential setup (new LLM API token)
 python3 scripts/setup_credentials.py
@@ -133,6 +151,7 @@ python3 scripts/setup_credentials.py
 ## Gotchas
 
 - **Memory path must be absolute** — injected into system prompt so the LLM can use file_reader/file_writer tools. `config.DATA_DIR` is resolved at import time; don't move `data/` after startup without restarting.
+- **memory.md is capped** — the injected copy is cut to `MEMORY_MAX_CHARS` (head + `## Reminders`, with a truncation marker), and `core/memory_guard.py` condenses the file itself when it passes `MEMORY_SOFT_CHARS` (at startup, every heartbeat tick, after a turn, and on context overflow). Each condense first copies the old file to `data/memory_backups/`; restore by copying a backup back over `data/memory.md`. Live status belongs in `data/status.md`.
 - **Bot API key survives restarts** — stored in `data/.apikey`. Delete it to force re-registration with Messenger.
 - **Streaming requires LLM API SSE support** — if the LLM API doesn't return `tool_status` events, tool-status messages won't appear, but the final reply still sends.
 - **Heartbeat first tick is delayed** — runs after one full interval at startup, never immediately.

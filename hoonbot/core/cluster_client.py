@@ -11,12 +11,31 @@ import config
 
 
 _DIRECTIVE_RE = re.compile(r"^\s*@([A-Za-z0-9_.:-]+)\s*(.*)$", re.DOTALL)
-_RESERVED = {"bot", "clear", "compact", "stop"}
+_RESERVED = {"bot", "clear", "compact", "stop", "goal"}
 
 
 def _estimate_tokens(text: str) -> int:
     """Approximate token count (UTF-8 bytes // 3) — matches llm-api's estimator."""
     return len(text.encode("utf-8")) // 3
+
+
+def _transcript_token_budget() -> int:
+    try:
+        tokens = int(getattr(config, "CLUSTER_DELEGATION_TRANSCRIPT_TOKENS", 32000))
+    except (TypeError, ValueError):
+        tokens = 32000
+    return max(1000, tokens)
+
+
+def _head_tail(text: str, limit: int, head_ratio: float = 0.3) -> str:
+    """Keep the head and tail of *text* within *limit* chars, with a marker."""
+    if len(text) <= limit:
+        return text
+    head = int(limit * head_ratio)
+    tail = max(0, limit - head)
+    omitted = len(text) - head - tail
+    tail_text = text[-tail:] if tail else ""
+    return f"{text[:head]}\n\n…({omitted:,} chars omitted)…\n\n{tail_text}"
 
 
 def _headers() -> dict[str, str]:
@@ -46,9 +65,10 @@ async def _fetch_history_block(client: httpx.AsyncClient, session_id: str) -> st
     except Exception:
         return ""
 
-    # Keep the most-recent turns within a token budget (newest-first, then
-    # restore chronological order). Uniform with llm-api's recent-context cap.
-    max_tokens = int(getattr(config, "MAX_CONVERSATION_TOKENS", 200_000))
+    # Keep the most-recent turns within the delegation budget (newest-first,
+    # then restore chronological order). Deliberately much smaller than the
+    # room's own context window: the slave pays a cold prefill for every byte.
+    max_tokens = _transcript_token_budget()
     lines_rev: list[str] = []
     used = 0
     truncated = False
@@ -75,6 +95,10 @@ async def _fetch_history_block(client: httpx.AsyncClient, session_id: str) -> st
     transcript = "\n\n".join(lines)
     if truncated:
         transcript = "…(earlier turns omitted)…\n\n" + transcript
+    # Hard char cap (~4 chars/token): a single huge turn can exceed the token
+    # budget on its own. Keep head + tail so both the setup and the most
+    # recent exchange survive.
+    transcript = _head_tail(transcript, max_tokens * 4)
 
     return (
         "\n\n<conversation_context>\n"

@@ -6,10 +6,15 @@ data lives, and what changed since last time. Run from the heartbeat every few
 ticks, it writes a compact map to ``data/filesystem_map.md`` and records drift
 (added / removed / modified) against the previous scan.
 
-Kept OUT of memory.md on purpose — memory.md is injected wholesale into every
-session, so a full tree there would bloat the prompt every turn. Instead the
-heartbeat surfaces a one-line digest via build_per_turn_context, and the agent
-can file_reader the full map on demand at the path in Session Variables.
+Kept OUT of memory.md on purpose — memory.md is injected into every session
+(capped at MEMORY_MAX_CHARS), so a full tree there would eat that budget every
+turn. Instead the heartbeat surfaces a one-line digest via
+build_per_turn_context, and the agent can file_reader the full map on demand at
+the path in Session Variables.
+
+Runtime data dirs (hoonbot/data, llm-api/data, messenger/data) are not walked:
+their churn (sessions, logs, memory backups) would drown the drift signal.
+Writes are atomic (tmp + os.replace) so a crash never leaves a torn state file.
 """
 
 from __future__ import annotations
@@ -38,6 +43,19 @@ _EXCLUDE_DIRS = {
     "models", "llamacpp", ".cache",
 }
 
+# Absolute runtime-data directories skipped during the walk (both the resolved
+# and the plain absolute spelling, so a symlinked checkout still matches).
+_EXCLUDE_PATHS = {
+    os.path.normcase(form)
+    for p in (
+        _DATA_DIR,
+        _HOONBOT_DIR / "data",
+        _REPO_ROOT / "llm-api" / "data",
+        _REPO_ROOT / "messenger" / "data",
+    )
+    for form in (str(p.resolve()), os.path.abspath(str(p)))
+}
+
 # Roots to scan. The repo gives project structure; hoonbot's own runtime dirs
 # (skills/prompts) are where the bot's editable behavior lives — drift there is
 # the most useful signal.
@@ -60,7 +78,12 @@ def _walk(root: Path) -> dict[str, float]:
     root_depth = len(root.resolve().parts)
     for dirpath, dirnames, filenames in os.walk(root):
         # Prune excluded dirs in place so os.walk doesn't descend into them.
-        dirnames[:] = [d for d in dirnames if d not in _EXCLUDE_DIRS and not d.startswith(".")]
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in _EXCLUDE_DIRS
+            and not d.startswith(".")
+            and os.path.normcase(os.path.abspath(os.path.join(dirpath, d))) not in _EXCLUDE_PATHS
+        ]
         depth = len(Path(dirpath).resolve().parts) - root_depth
         if depth >= _MAX_DEPTH:
             dirnames[:] = []
@@ -198,10 +221,10 @@ def run_snapshot() -> str:
 
     try:
         _DATA_DIR.mkdir(parents=True, exist_ok=True)
-        MAP_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        _STATE_FILE.write_text(
+        _atomic_write_text(MAP_FILE, "\n".join(lines) + "\n")
+        _atomic_write_text(
+            _STATE_FILE,
             json.dumps({"generated_at": ts, "digest": digest, "files": cur}, ensure_ascii=False),
-            encoding="utf-8",
         )
     except Exception:
         pass  # snapshot is best-effort; never break the heartbeat
@@ -209,10 +232,48 @@ def run_snapshot() -> str:
     return digest
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write *text* to *path* via a same-dir tmp file + os.replace."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        for attempt in range(10):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                # Windows: a concurrent reader can block the rename briefly.
+                if attempt == 9:
+                    raise
+                time.sleep(0.1)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+_digest_cache: dict[str, Any] = {"key": None, "digest": ""}
+
+
 def get_digest() -> str:
     """Return the last digest cheaply (no walk) for ambient context. '' if none."""
     try:
+        st = _STATE_FILE.stat()
+        key = (st.st_mtime_ns, st.st_size)
+        if _digest_cache["key"] == key:
+            return _digest_cache["digest"]
         state = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
-        return str(state.get("digest", "")) if isinstance(state, dict) else ""
+        digest = str(state.get("digest", "")) if isinstance(state, dict) else ""
+        _digest_cache["key"] = key
+        _digest_cache["digest"] = digest
+        return digest
     except Exception:
         return ""

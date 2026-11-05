@@ -1,16 +1,18 @@
 [System: This session has accumulated enough turns that context compaction is
-likely. Before that happens, take one pass over the recent conversation and
-the current memory file:
+likely. memory.md is currently {memory_chars} / {memory_cap} chars (keep it
+under ~8,000). Before compaction, take one short pass:
 
-1. Identify durable, non-trivial facts the user would want preserved across
-   sessions: preferences, decisions, ongoing project state, scheduled
-   reminders, names/handles, recurring tasks.
-2. Skip transient chat noise, jokes, banter, one-off questions, and content
-   that is already obvious from the codebase or git history.
-3. Read the existing memory file with file_reader, merge new facts in
-   place (do not overwrite unrelated entries), and write the full updated
-   Markdown file back. Include dates for time-sensitive entries.
-4. Do not save secrets, raw tokens, credentials, or `.env` contents.
+1. Identify durable, non-trivial facts from the recent conversation that the
+   user would want preserved across sessions: preferences, decisions, stable
+   paths/IDs, open reminders, recurring tasks.
+2. Skip chat noise, one-off questions, live status, metrics, logs, command
+   output, and anything already obvious from the codebase or git history.
+   Live status belongs in data/status.md, not memory.md.
+3. Read memory.md with file_reader, then add or update entries in place with
+   file_edit or apply_patch (one concise dated bullet per fact). Do not
+   rewrite the whole file. While there, delete entries that are stale,
+   superseded, or done, so the file shrinks rather than grows.
+4. Do not save secrets, raw tokens, credentials, or .env contents.
 
-If there is nothing new worth saving, do not touch the memory file. Reply
-to the user normally.]
+If there is nothing new worth saving and nothing stale to prune, do not touch
+the memory file. Reply to the user normally.]

@@ -5,7 +5,7 @@
 
 One file, at the repo root, controls every machine and every service
 (llm-api, hoonbot, messenger). To set up a node you only edit the EDIT HERE
-block: pick master/slave, set this machine's IP, point at your llama.cpp
+block: pick master/slave, set this machine's IP, point at your vLLM
 server, and (for a real deployment) change the secrets.
 
 The three apps each load this file at startup and read their settings from it,
@@ -67,7 +67,21 @@ VLLM_MODEL = "GLM-5.2"
 # MODEL_CONTEXT_WINDOW: vLLM's --max-model-len (max prompt + output tokens
 # per request). Keep it equal to the launch flag. llm-api derives its compaction
 # trigger and token budgets from this; 0 = auto-detect from vLLM /v1/models.
-MODEL_CONTEXT_WINDOW = 200_000
+# llm-api uses min(this, vLLM's reported max_model_len), so a too-large value
+# can't cause oversize requests — but a too-small one wastes the window.
+MODEL_CONTEXT_WINDOW = 1_000_000
+# VLLM_MAX_CONCURRENT_REQUESTS: max in-flight requests one llm-api process sends
+# to vLLM at once (parent turns + subagents + cluster tasks). Extra requests
+# queue instead of failing. Roughly vLLM's --max-num-seqs.
+VLLM_MAX_CONCURRENT_REQUESTS = 64
+# SUBAGENT_MAX_CONCURRENT: max subagents (`agent` tool) running at once across
+# all sessions on this node. Several subagent calls in one turn run in parallel.
+SUBAGENT_MAX_CONCURRENT = 32
+
+# ─── Network ────────────────────────────────────────────────────────────────
+# AIRGAPPED: True when the servers have no outbound internet. Removes the
+# websearch tool and tells the agent not to pip install / fetch from the web.
+AIRGAPPED = True
 
 # ─── Service ports ──────────────────────────────────────────────────────────
 MESSENGER_PORT = 10006
@@ -95,6 +109,18 @@ HEARTBEAT_ENABLED          = True
 HEARTBEAT_INTERVAL_SECONDS = 3600
 HEARTBEAT_ACTIVE_START     = "00:00"       # 24h HH:MM — only run in this window
 HEARTBEAT_ACTIVE_END       = "23:59"
+# memory.md (the bot's long-term memory, injected into every session's system
+# prompt) is kept SMALL. Above MEMORY_SOFT_CHARS it is condensed automatically
+# (backup in data/memory_backups/); injection is hard-capped at MEMORY_MAX_CHARS.
+MEMORY_MAX_CHARS           = 12000
+MEMORY_SOFT_CHARS          = 8000
+# FOLLOWUP_POLICY: messages that arrive in a room while the bot is still
+# answering. "queue" = answered next, in order, each kept distinguishable
+# (default). "interrupt" = a follow-up from the SAME sender cancels and merges
+# into the running turn (other senders still queue).
+FOLLOWUP_POLICY            = "queue"
+# Max conversation transcript (tokens) sent along with a delegated cluster task.
+CLUSTER_DELEGATION_TRANSCRIPT_TOKENS = 32000
 
 # ─── Messenger service (messenger/) ─────────────────────────────────────────
 # Token gating the embedded /claude and /opencode terminals. CHANGE in prod.
@@ -118,6 +144,21 @@ def _csv(name: str, default: list[str]) -> list[str]:
     if not raw:
         return list(default)
     return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _int(name: str, default: int) -> int:
+    raw = _env(name, str(default))
+    try:
+        return int(str(raw).replace("_", ""))
+    except ValueError:
+        return int(default)
+
+
+def _bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return bool(default)
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _url(host: str, port: int, scheme: str = "http") -> str:
@@ -229,6 +270,26 @@ VLLM_MODEL = _env("VLLM_MODEL", VLLM_MODEL)
 
 
 # ---------------------------------------------------------------------------
+# Model / capacity / memory knobs (env overrides of the EDIT HERE values)
+# ---------------------------------------------------------------------------
+
+MODEL_CONTEXT_WINDOW = max(0, _int("MODEL_CONTEXT_WINDOW", MODEL_CONTEXT_WINDOW))  # 0 = auto-detect
+VLLM_MAX_CONCURRENT_REQUESTS = max(1, _int("VLLM_MAX_CONCURRENT_REQUESTS", VLLM_MAX_CONCURRENT_REQUESTS))
+SUBAGENT_MAX_CONCURRENT = max(1, _int("SUBAGENT_MAX_CONCURRENT", SUBAGENT_MAX_CONCURRENT))
+AIRGAPPED = _bool("AIRGAPPED", AIRGAPPED)
+MEMORY_MAX_CHARS = max(1000, _int("MEMORY_MAX_CHARS", MEMORY_MAX_CHARS))
+# The soft cap (condense target) must stay below the hard cap (and not so low
+# that memory is condensed on every tick).
+MEMORY_SOFT_CHARS = max(500, min(_int("MEMORY_SOFT_CHARS", MEMORY_SOFT_CHARS), MEMORY_MAX_CHARS))
+FOLLOWUP_POLICY = _env("FOLLOWUP_POLICY", FOLLOWUP_POLICY).lower()
+if FOLLOWUP_POLICY not in {"queue", "interrupt"}:
+    FOLLOWUP_POLICY = "queue"
+CLUSTER_DELEGATION_TRANSCRIPT_TOKENS = max(
+    1000, _int("CLUSTER_DELEGATION_TRANSCRIPT_TOKENS", CLUSTER_DELEGATION_TRANSCRIPT_TOKENS)
+)
+
+
+# ---------------------------------------------------------------------------
 # Cluster control plane
 # ---------------------------------------------------------------------------
 
@@ -240,7 +301,8 @@ CLUSTER_TASK_LEASE_SECONDS = int(_env("CLUSTER_TASK_LEASE_SECONDS", "900"))
 CLUSTER_SLAVE_POLL_INTERVAL_SECONDS = float(_env("CLUSTER_SLAVE_POLL_INTERVAL_SECONDS", "3"))
 # Max cluster tasks a slave executes concurrently (vLLM batches the requests).
 # Higher = more headroom so a few slow/hung slots can't starve the whole slave;
-# hung slots now self-release via the LLM timeout (see hoonbot LLM_TIMEOUT_SECONDS).
+# hung slots self-release via the stream idle watchdogs (llm-api
+# STREAM_IDLE_TIMEOUT_SECONDS toward vLLM, hoonbot LLM_STREAM_IDLE_TIMEOUT_SECONDS).
 CLUSTER_SLAVE_MAX_CONCURRENT_TASKS = int(_env("CLUSTER_SLAVE_MAX_CONCURRENT_TASKS", "20"))
 
 if NODE_ROLE == "master":

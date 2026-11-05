@@ -3,12 +3,15 @@ Hoonbot — entry point.
 
 Startup sequence:
 1. Health-check LLM API
-2. Register bot with Messenger (get / restore API key)
-3. Register webhook subscription (new_message, message_edited, message_deleted)
-4. Resolve home room by name (if configured)
-5. Catch up on missed messages
-6. Start heartbeat loop
-7. Serve FastAPI on HOONBOT_PORT
+2. Schedule a background memory.md size check (core.memory_guard)
+3. Register bot with Messenger (get / restore API key)
+4. Register webhook subscription (new_message, message_edited, message_deleted)
+5. Resolve home room by name (if configured)
+6. Catch up on missed messages (via the per-room queue when available)
+7. Start heartbeat loop
+8. Serve FastAPI on HOONBOT_PORT
+
+Slave nodes run only the cluster worker loop plus a periodic memory size check.
 """
 import asyncio
 import logging
@@ -25,7 +28,7 @@ from core.heartbeat import run_heartbeat_loop
 from core.llm_api import close_client as close_llm_client
 from core.retry import with_retry
 from handlers.health import router as health_router
-from handlers.webhook import router as webhook_router, process_message
+from handlers.webhook import router as webhook_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -108,6 +111,9 @@ async def _register_bot() -> None:
             max_attempts=config.STARTUP_RETRY_ATTEMPTS,
             base_delay=config.STARTUP_RETRY_DELAY,
             label="Messenger bot registration",
+            # Registration mints a new key: a resend after the request reached
+            # Messenger would orphan the first one. Retry connect-phase only.
+            idempotent=False,
         )
         messenger.set_api_key(key)
         _save_key(key)
@@ -149,6 +155,7 @@ async def _subscribe_webhooks() -> None:
         messenger.register_bot, config.MESSENGER_BOT_NAME,
         max_attempts=retries, base_delay=delay,
         label="Messenger bot registration",
+        idempotent=False,
     )
     messenger.set_api_key(key)
     _save_key(key)
@@ -195,63 +202,225 @@ async def _resolve_home_room() -> None:
     return
 
 
-async def _catch_up_room(room: dict, semaphore: asyncio.Semaphore) -> None:
+# The webhook queue marks a message that is waiting for the next turn with the
+# bot's ⏳ reaction. Unanswered messages are no longer *detected* through it —
+# handlers.webhook persists queued / in-flight msg_ids in data/room_queue.json
+# — but a message replayed from that file may still carry the previous run's
+# ⏳, which the new queue item does not own, so catch-up clears it.
+_WAITING_REACTION = "⏳"
+
+
+def _is_human(msg: dict) -> bool:
+    return msg.get("senderName") != config.MESSENGER_BOT_NAME and not msg.get("isBot")
+
+
+def _is_candidate(msg) -> bool:
+    """A live, human message. Whether it is actually replayable (text or
+    attachments, room gating) is decided by enqueue_catchup_message."""
+    return isinstance(msg, dict) and _is_human(msg) and not msg.get("isDeleted")
+
+
+def _bot_reacted_waiting(msg: dict, bot_id) -> bool:
+    if bot_id is None:
+        return False
+    for entry in msg.get("reactions") or []:
+        if isinstance(entry, dict) and entry.get("emoji") == _WAITING_REACTION:
+            return str(bot_id) in {str(u) for u in (entry.get("userIds") or [])}
+    return False
+
+
+def _id_sort_key(msg: dict):
+    try:
+        return (0, int(msg.get("id")))
+    except (TypeError, ValueError):
+        return (1, 0)
+
+
+async def _catch_up_room(room_id, semaphore: asyncio.Semaphore, bot_id=None,
+                         persisted_ids: list | None = None) -> None:
+    """Replay one room: every human message after the bot's last post, plus
+    the messages the previous run left queued / in flight (*persisted_ids*,
+    from data/room_queue.json), in id order."""
+    from handlers import webhook as _webhook
+
     async with semaphore:
-        room_id = room["id"]
-        messages = await messenger.get_room_messages(room_id, limit=config.CATCHUP_MESSAGE_LIMIT)
-        if not messages:
-            return
+        persisted_ids = list(persisted_ids or [])
+        messages = await messenger.get_room_messages(room_id, limit=config.CATCHUP_MESSAGE_LIMIT) or []
 
-        # Find the last human text message
-        last_human_idx = -1
+        # Only THIS bot's own messages mark the "already replied" cut-off
+        # (other bots' posts must not hide missed messages).
+        last_bot_idx = -1
         for i, msg in enumerate(messages):
-            if (
-                msg.get("senderName") != config.MESSENGER_BOT_NAME
-                and not msg.get("isBot")
-                and msg.get("type") == "text"
-                and msg.get("content", "").strip()
-            ):
-                last_human_idx = i
+            if isinstance(msg, dict) and msg.get("senderName") == config.MESSENGER_BOT_NAME:
+                last_bot_idx = i
 
-        if last_human_idx == -1:
+        window = {str(m.get("id")): m for m in messages if isinstance(m, dict) and m.get("id") is not None}
+        missed: dict = {}
+        for i, msg in enumerate(messages):
+            if i > last_bot_idx and _is_candidate(msg) and msg.get("id") is not None:
+                missed[str(msg["id"])] = msg
+
+        # Messages accepted by the previous run but never answered. They may be
+        # older than the bot's last post (a later turn, heartbeat or relay
+        # result) or outside the history window, so fetch them by id.
+        accepted_keys: set = set()
+        forget = getattr(_webhook, "forget_persisted", None)
+        for mid in persisted_ids:
+            key = str(mid)
+            msg = window.get(key)
+            if msg is None:
+                try:
+                    msg = await messenger.get_message(room_id, mid)
+                except Exception as exc:
+                    # Messenger unreachable: keep the id for the next start.
+                    logger.warning(f"[CatchUp] Room {room_id}: could not fetch persisted message {mid}: {exc}")
+                    continue
+            if not _is_candidate(msg):
+                logger.info(f"[CatchUp] Room {room_id}: persisted message {mid} is gone or deleted — dropped")
+                if callable(forget):
+                    forget(room_id, mid)
+                continue
+            missed[key] = msg
+            accepted_keys.add(key)
+
+        if not missed:
+            return
+        missed_msgs = sorted(missed.values(), key=_id_sort_key)
+
+        # Prefer the per-room queue (handlers.webhook owns it): replay EVERY
+        # missed human message, in id order, so nothing sent while the bot
+        # was offline is dropped and the queue's msg_id dedupe guarantees a
+        # message is never answered twice. Attachments are rebuilt by
+        # enqueue_catchup_message exactly like the live webhook does.
+        enqueue = getattr(_webhook, "enqueue_catchup_message", None)
+        if callable(enqueue):
+            logger.info(
+                f"[CatchUp] Room {room_id}: queueing {len(missed_msgs)} missed message(s)"
+                + (f" ({len(accepted_keys)} left queued by the previous run)" if accepted_keys else "")
+            )
+            prev: tuple | None = None  # (sender, accepted) of the previous replayed message
+            for m in missed_msgs:
+                key = str(m.get("id"))
+                accepted = key in accepted_keys
+                if accepted and _bot_reacted_waiting(m, bot_id):
+                    try:
+                        await messenger.remove_reaction(room_id, m.get("id"), _WAITING_REACTION)
+                    except Exception:
+                        pass
+                sender = m.get("senderName")
+                continuation = bool(prev and prev[0] == sender and prev[1])
+                try:
+                    result = await enqueue(room_id, m, continuation=continuation, accepted=accepted)
+                except Exception as exc:
+                    logger.error(f"[CatchUp] Room {room_id}: replay of message {m.get('id')} failed: {exc}")
+                    result = "error"
+                prev = (sender, result in ("queued", "duplicate", "clear"))
             return
 
-        # Skip if Hoonbot already replied after that message
-        already_replied = any(
-            msg.get("senderName") == config.MESSENGER_BOT_NAME
-            for msg in messages[last_human_idx + 1:]
-        )
-        if already_replied:
+        # Legacy path: answer only the last missed human text message directly.
+        texts = [m for m in missed_msgs if m.get("type") == "text" and (m.get("content") or "").strip()]
+        if not texts:
             return
-
-        missed = messages[last_human_idx]
-        content = missed.get("content", "").strip()
-        sender = missed.get("senderName", "unknown")
-        msg_id = missed.get("id")
+        missed_msg = texts[-1]
+        content = missed_msg.get("content", "").strip()
+        sender = missed_msg.get("senderName", "unknown")
+        msg_id = missed_msg.get("id")
         logger.info(f"[CatchUp] Room {room_id}: missed msg from {sender!r}: {content[:50]!r}")
-        await process_message(room_id, content, sender, msg_id)
+        await _webhook.process_message(room_id, content, sender, msg_id)
 
 
 async def _catch_up() -> None:
-    """Process the last unanswered human message in each room (handles offline period)."""
+    """Replay human messages the bot missed in each room (offline period, or
+    still queued / in flight when the previous run stopped)."""
+    from handlers import webhook as _webhook
+
+    try:
+        persisted = _webhook.persisted_queue() if hasattr(_webhook, "persisted_queue") else {}
+    except Exception as exc:
+        logger.warning(f"[CatchUp] Could not read persisted queue state: {exc}")
+        persisted = {}
+
     bot_info = await messenger.get_bot_info()
     if not bot_info:
-        logger.warning("[CatchUp] Could not get bot info, skipping")
+        logger.warning("[CatchUp] Could not get bot info, skipping (persisted queue kept for the next start)")
         return
 
-    rooms = await messenger.get_rooms(bot_info["id"])
-    logger.info(f"[CatchUp] Scanning {len(rooms)} room(s) for missed messages")
-    if not rooms:
+    rooms = await messenger.get_rooms(bot_info["id"]) or []
+    room_ids: list = []
+    seen: set = set()
+    for room in rooms:
+        rid = room.get("id") if isinstance(room, dict) else None
+        if rid is None or str(rid) in seen:
+            continue
+        seen.add(str(rid))
+        room_ids.append(rid)
+    # Rooms with persisted messages are replayed even when the room list does
+    # not include them (a room the bot left drops its ids on fetch).
+    for rid in persisted:
+        if str(rid) not in seen:
+            seen.add(str(rid))
+            room_ids.append(rid)
+    pending_by_room = {str(k): v for k, v in persisted.items()}
+
+    logger.info(
+        f"[CatchUp] Scanning {len(room_ids)} room(s) for missed messages"
+        + (f" ({sum(len(v) for v in persisted.values())} persisted)" if persisted else "")
+    )
+    if not room_ids:
         return
 
     semaphore = asyncio.Semaphore(_CATCHUP_MAX_CONCURRENCY)
     results = await asyncio.gather(
-        *(_catch_up_room(room, semaphore) for room in rooms),
+        *(
+            _catch_up_room(rid, semaphore, bot_info.get("id"), pending_by_room.get(str(rid)))
+            for rid in room_ids
+        ),
         return_exceptions=True,
     )
     for result in results:
         if isinstance(result, Exception):
             logger.error(f"[CatchUp] Room catch-up failed: {result}", exc_info=result)
+
+
+# Slaves run no heartbeat loop and no webhook post-turn hook, so they re-check
+# memory.md on this period (cheap when under the soft cap: one file read).
+_SLAVE_MEMORY_CHECK_SECONDS = 300.0
+
+
+def _start_memory_guard(repeat_every: float | None = None) -> asyncio.Task:
+    """Schedule a memory.md size check in the background: once, or — with
+    *repeat_every* (seconds) — at startup and then periodically."""
+    from core import memory_guard
+
+    async def _run() -> None:
+        try:
+            size = memory_guard.memory_size()
+            logger.info(
+                f"[Hoonbot] memory.md: {size:,} / {memory_guard.MEMORY_MAX_CHARS:,} chars "
+                f"(soft cap {memory_guard.MEMORY_SOFT_CHARS:,})"
+            )
+            await memory_guard.enforce_memory_cap("startup")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # enforce_memory_cap never raises; belt and braces
+            logger.warning(f"[Hoonbot] Startup memory guard failed: {exc}")
+        if not repeat_every:
+            return
+        while True:
+            await asyncio.sleep(repeat_every)
+            try:
+                await memory_guard.enforce_memory_cap("periodic")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(f"[Hoonbot] Periodic memory guard failed: {exc}")
+
+    task = asyncio.create_task(_run())
+    task.add_done_callback(
+        lambda t: None if t.cancelled() or not t.exception()
+        else logger.error(f"[Hoonbot] Background task 'memory_guard' died: {t.exception()}")
+    )
+    return task
 
 # ---------------------------------------------------------------------------
 # Application lifespan
@@ -265,21 +434,33 @@ async def lifespan(app: FastAPI):
         from core.cluster_worker import run_slave_worker_loop
 
         worker_task = asyncio.create_task(run_slave_worker_loop())
+        # Periodic, not one-shot: delegated tasks may append to memory.md and
+        # nothing else on a slave would ever condense it again.
+        slave_memory_task = _start_memory_guard(repeat_every=_SLAVE_MEMORY_CHECK_SECONDS)
         logger.info(f"[Hoonbot] Slave node '{config.NODE_NAME}' ready on port {config.HOONBOT_PORT}")
         try:
             yield
         finally:
             worker_task.cancel()
-            await asyncio.gather(worker_task, return_exceptions=True)
+            slave_memory_task.cancel()
+            await asyncio.gather(worker_task, slave_memory_task, return_exceptions=True)
             await close_llm_client()
             logger.info("[Hoonbot] Slave shutdown complete")
         return
 
     await _autofind_llm_api()
-    await _register_bot()
-    await _fetch_bot_identity()
-    await _subscribe_webhooks()
-    await _resolve_home_room()
+    # Condense an oversized memory.md in the background (never blocks startup);
+    # scheduled after LLM API discovery so it targets the right URL.
+    memory_task = _start_memory_guard()
+    try:
+        await _register_bot()
+        await _fetch_bot_identity()
+        await _subscribe_webhooks()
+        await _resolve_home_room()
+    except BaseException:
+        # Startup aborted: don't leave the background condense running.
+        memory_task.cancel()
+        raise
 
     logger.info(f"[Hoonbot] Ready on port {config.HOONBOT_PORT}")
     logger.info(
@@ -308,10 +489,24 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # Stop catch-up first (unreplayed persisted ids simply stay on disk), then
+    # drain the room queues: running turns are settled with a restart marker
+    # and every unanswered msg_id is flushed to data/room_queue.json for the
+    # next start's catch-up.
     catchup_task.cancel()
+    await asyncio.gather(catchup_task, return_exceptions=True)
+    try:
+        from handlers import webhook as _webhook
+        shutdown_room_workers = getattr(_webhook, "shutdown_room_workers", None)
+        if callable(shutdown_room_workers):
+            await shutdown_room_workers()
+    except Exception as exc:
+        logger.warning(f"[Hoonbot] Room worker shutdown failed: {exc}")
+
     heartbeat_task.cancel()
     relay_task.cancel()
-    await asyncio.gather(catchup_task, heartbeat_task, relay_task, return_exceptions=True)
+    memory_task.cancel()
+    await asyncio.gather(catchup_task, heartbeat_task, relay_task, memory_task, return_exceptions=True)
     await close_llm_client()
     await messenger.close_client()
     logger.info("[Hoonbot] Shutdown complete")

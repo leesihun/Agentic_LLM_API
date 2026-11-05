@@ -10,12 +10,16 @@ Both streaming and non-streaming go through the AgentLoop,
 which uses native tool calling via llama.cpp.
 """
 import asyncio
+import inspect
 import json
 import time
 import uuid
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 from fastapi import APIRouter, HTTPException, Depends, Request
+from fastapi.responses import JSONResponse
+from filelock import Timeout as FileLockTimeout
+from starlette.background import BackgroundTask
 from starlette.datastructures import UploadFile
 from sse_starlette.sse import EventSourceResponse
 
@@ -27,12 +31,20 @@ from backend.models.schemas import (
     ChatCompletionChunkChoice,
     ChatCompletionChunkDelta,
 )
-from backend.core.database import db, conversation_store
+from backend.core.database import db, conversation_store, SessionBusyError
 from backend.core.llm_backend import TextEvent, ToolStatusEvent
 from backend.utils.file_handler import save_uploaded_files, extract_file_metadata, is_image_file, encode_image_base64
 from backend.utils.auth import get_optional_user
+from backend.utils.stop_signal import StopInferenceError, clear_session_stop
+from backend.api.routes.sessions import stop_enforced_events
 from backend.agent import AgentLoop
 import config
+
+try:  # partition A contract (C1); tolerate an older backend during rollout
+    from backend.core.llm_backend import VllmStreamError
+except ImportError:  # pragma: no cover
+    class VllmStreamError(Exception):  # type: ignore[no-redef]
+        pass
 
 router = APIRouter(prefix="/v1", tags=["chat"])
 
@@ -48,12 +60,70 @@ def _format_exception(exc: Exception) -> str:
 # Request parsing — handles both JSON and multipart/form-data
 # ---------------------------------------------------------------------------
 
+_TRUE_STRINGS = {"1", "true", "yes", "on"}
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    """Parse a bool from JSON (bool/number) or form (string) input."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    return text in _TRUE_STRINGS
+
+
+def _as_optional_float(value: Any, field: str) -> Optional[float]:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"Invalid {field}: {value!r}")
+
+
+def _as_optional_int(value: Any, field: str) -> Optional[int]:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"Invalid {field}: {value!r}")
+
+
+def _reasoning_effort_kwargs(value: Any) -> Optional[Dict[str, Any]]:
+    """Map the `reasoning_effort` request field onto chat_template_kwargs (C5).
+
+    "max" | "high" -> {"reasoning_effort": value}; "none" -> non-thinking
+    mode ({"enable_thinking": False}); unset -> None (config default).
+    """
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text in ("none", "off", "false", "disabled"):
+        return {"enable_thinking": False}
+    if text in ("max", "high"):
+        return {"reasoning_effort": text}
+    raise HTTPException(
+        status_code=400,
+        detail=f"Invalid reasoning_effort {value!r}; expected 'max', 'high' or 'none'",
+    )
+
+
 async def _parse_request(request: Request) -> dict:
     """
     Parse /v1/chat/completions from either JSON or multipart form.
 
     Returns a dict with keys:
-      messages_data, model, stream, temperature, max_tokens, session_id, files
+      messages_data, model, stream, temperature, max_tokens, session_id,
+      workspace, mode, files, response_format, guided_json,
+      disable_tools, ephemeral, chat_template_kwargs
     """
     content_type = request.headers.get("content-type", "")
 
@@ -61,7 +131,7 @@ async def _parse_request(request: Request) -> dict:
         form = await request.form()
         messages_raw = form.get("messages", "[]")
         model = form.get("model") or None
-        stream = str(form.get("stream", "false")).lower() == "true"
+        stream = _as_bool(form.get("stream"), False)
         temperature = form.get("temperature")
         max_tokens = form.get("max_tokens")
         session_id = form.get("session_id") or None
@@ -69,6 +139,9 @@ async def _parse_request(request: Request) -> dict:
         mode = form.get("mode") or None
         response_format = form.get("response_format")
         guided_json = form.get("guided_json")
+        disable_tools = _as_bool(form.get("disable_tools"), False)
+        ephemeral = _as_bool(form.get("ephemeral"), False)
+        reasoning_effort = form.get("reasoning_effort")
         files = [v for v in form.getlist("files") if isinstance(v, UploadFile) and v.filename]
         try:
             messages_data = json.loads(messages_raw)
@@ -80,9 +153,11 @@ async def _parse_request(request: Request) -> dict:
             body = await request.json()
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid JSON body")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="JSON body must be an object")
         messages_data = body.get("messages", [])
         model = body.get("model") or None
-        stream = bool(body.get("stream", False))
+        stream = _as_bool(body.get("stream"), False)
         temperature = body.get("temperature")
         max_tokens = body.get("max_tokens")
         session_id = body.get("session_id") or None
@@ -90,7 +165,13 @@ async def _parse_request(request: Request) -> dict:
         mode = body.get("mode") or None
         response_format = body.get("response_format")
         guided_json = body.get("guided_json")
+        disable_tools = _as_bool(body.get("disable_tools"), False)
+        ephemeral = _as_bool(body.get("ephemeral"), False)
+        reasoning_effort = body.get("reasoning_effort")
         files = []
+
+    if not isinstance(messages_data, list):
+        raise HTTPException(status_code=400, detail="messages must be a list")
 
     # response_format / guided_json may arrive as a JSON-encoded string (form
     # posts) or an object (JSON body). Normalize to a dict or None.
@@ -106,14 +187,17 @@ async def _parse_request(request: Request) -> dict:
         messages_data=messages_data,
         model=model,
         stream=stream,
-        temperature=float(temperature) if temperature is not None else None,
-        max_tokens=int(max_tokens) if max_tokens is not None else None,
-        session_id=session_id,
+        temperature=_as_optional_float(temperature, "temperature"),
+        max_tokens=_as_optional_int(max_tokens, "max_tokens"),
+        session_id=str(session_id) if session_id else None,
         workspace=workspace,
         mode=mode,
         files=files,
         response_format=_coerce_obj(response_format),
         guided_json=_coerce_obj(guided_json),
+        disable_tools=disable_tools,
+        ephemeral=ephemeral,
+        chat_template_kwargs=_reasoning_effort_kwargs(reasoning_effort),
     )
 
 
@@ -239,6 +323,223 @@ def _prepare_messages_with_files(
 
 
 # ---------------------------------------------------------------------------
+# Turn bookkeeping
+# ---------------------------------------------------------------------------
+
+# How long a new turn waits for the previous turn on the same session to
+# release its lease before answering 409 "session busy" (hoonbot retries 409).
+_LEASE_WAIT_SECONDS = 2.0
+# Non-streaming path: how often to poll for a client disconnect.
+_DISCONNECT_POLL_SECONDS = 1.0
+# Max distinct tool names listed in the persisted ledger of a turn.
+_LEDGER_MAX_TOOLS = 20
+
+_DIAGNOSTIC_DEFAULTS: Dict[str, Any] = {
+    "finish_reason": "stop",
+    "iterations": 0,
+    "truncation_continuations": 0,
+    "empty_retries": 0,
+    "tool_calls": 0,
+    "compactions": 0,
+    "fallback_used": False,
+}
+
+
+def _validate_session_id(session_id: str) -> None:
+    """Session ids become file names under data/sessions — refuse path tricks."""
+    if (
+        len(session_id) > 200
+        or session_id != session_id.strip()
+        or ".." in session_id
+        or any(ch in session_id for ch in ("/", "\\", "\x00"))
+    ):
+        raise HTTPException(status_code=400, detail="Invalid session_id")
+
+
+class _TurnRecord:
+    """What happened during one turn — drives persistence and diagnostics."""
+
+    def __init__(self) -> None:
+        self.assistant_parts: List[str] = []
+        self.tools: List[Tuple[str, bool]] = []
+        # Pessimistic defaults: anything that doesn't reach a known end
+        # (generator torn down by a client disconnect) counts as interrupted.
+        self.outcome = "interrupted"            # complete | interrupted | error
+        self.reason = "client disconnected"
+        self.finish_reason = "interrupted"      # stop | length | error | interrupted
+        self.persisted = False
+
+    @property
+    def assistant_text(self) -> str:
+        return "".join(self.assistant_parts)
+
+    def add_text(self, text: str) -> None:
+        if text:
+            self.assistant_parts.append(text)
+
+    def note_tool_status(self, event: ToolStatusEvent) -> None:
+        status = str(getattr(event, "status", "") or "").lower()
+        name = getattr(event, "tool_name", "") or "tool"
+        # Autocompaction is reported as a ToolStatusEvent but is not a tool
+        # the model ran — keep it out of the ledger/tool_calls count.
+        if name == "autocompact":
+            return
+        if status in ("completed", "failed"):
+            self.tools.append((name, status == "completed"))
+
+    def mark_complete(self, finish_reason: str) -> None:
+        """Record a run that ended without raising.
+
+        An agent that ends on its own with finish "interrupted"/"error" (it
+        caught the stop/error itself) is still persisted with the
+        "[interrupted]" marker, so the next turn knows the reply is partial.
+        """
+        self.finish_reason = finish_reason
+        if finish_reason == "interrupted":
+            self.outcome = "interrupted"
+            self.reason = "stopped by user request"
+        elif finish_reason == "error":
+            self.outcome = "error"
+            self.reason = "agent reported an error"
+        else:
+            self.outcome = "complete"
+            self.reason = ""
+
+    def tool_ledger(self) -> str:
+        """Compact "name ×N (k failed)" summary of the tools run this turn."""
+        counts: Dict[str, List[int]] = {}
+        for name, ok in self.tools:
+            entry = counts.setdefault(name, [0, 0])
+            entry[0] += 1
+            if not ok:
+                entry[1] += 1
+        parts: List[str] = []
+        for name, (total, failed) in list(counts.items())[:_LEDGER_MAX_TOOLS]:
+            part = name + (f" ×{total}" if total > 1 else "")
+            if failed:
+                part += f" ({failed} failed)"
+            parts.append(part)
+        extra = len(counts) - _LEDGER_MAX_TOOLS
+        if extra > 0:
+            parts.append(f"+{extra} more")
+        return ", ".join(parts)
+
+    def persisted_assistant_content(self) -> str:
+        """Assistant message to store for this turn (never empty).
+
+        A complete turn stores its answer verbatim. An interrupted/errored
+        turn stores the partial text plus an "[interrupted]" marker and the
+        tool ledger, so the next turn knows the earlier reply was cut off and
+        which side effects already happened (instead of believing it answered).
+        """
+        text = self.assistant_text
+        ledger = self.tool_ledger()
+        if self.outcome == "complete":
+            if text.strip():
+                return text
+            note = f"[no reply produced: finish_reason={self.finish_reason}"
+            if ledger:
+                note += f"; tools run this turn: {ledger}"
+            return note + "]"
+        marker = f"[interrupted] This reply was cut off before completion ({self.reason[:300]})."
+        if ledger:
+            marker += f" Tools run this turn: {ledger}."
+        else:
+            marker += " No tools completed this turn."
+        if text.strip():
+            return text.rstrip() + "\n\n" + marker
+        return marker
+
+
+def _agent_finish_reason(agent: Any) -> str:
+    """Real finish reason of a completed run (C7), normalised for clients."""
+    try:
+        finish = getattr(agent, "final_finish_reason", None)
+    except Exception:
+        finish = None
+    if not finish:
+        return "stop"
+    finish = str(finish)
+    if finish in ("tool", "tool_calls"):
+        return "stop"
+    return finish
+
+
+def _build_diagnostics(agent: Any, record: _TurnRecord) -> Dict[str, Any]:
+    diag: Dict[str, Any] = dict(_DIAGNOSTIC_DEFAULTS)
+    try:
+        # Never let a misbehaving diagnostics property break the final
+        # chunk / error event (the stream must still end with [DONE]).
+        agent_diag = getattr(agent, "diagnostics", None) if agent is not None else None
+    except Exception as exc:
+        print(f"[CHAT] WARNING: agent.diagnostics unavailable: {_format_exception(exc)}")
+        agent_diag = None
+    if isinstance(agent_diag, dict):
+        diag.update(agent_diag)
+    if not diag.get("tool_calls"):
+        diag["tool_calls"] = len(record.tools)
+    diag["finish_reason"] = record.finish_reason
+    try:
+        # Guarantee JSON-safety whatever the agent put in there.
+        return json.loads(json.dumps(diag, default=str))
+    except Exception:
+        return {"finish_reason": record.finish_reason}
+
+
+def _error_type(exc: BaseException) -> str:
+    if isinstance(exc, VllmStreamError):
+        return "upstream_error"
+    if isinstance(exc, asyncio.TimeoutError):
+        return "timeout"
+    return "internal_error"
+
+
+_AGENT_INIT_PARAMS: Optional[set] = None
+_AGENT_ACCEPTS_ANY_KWARG = False
+
+
+def _build_agent(**kwargs: Any) -> AgentLoop:
+    """Construct AgentLoop, dropping kwargs its constructor doesn't know.
+
+    Lets this route ship ahead of/behind agent-side changes (e.g. the
+    chat_template_kwargs / max_tokens parameters) without a TypeError; a
+    dropped non-None value is logged so the gap is visible.
+    """
+    global _AGENT_INIT_PARAMS, _AGENT_ACCEPTS_ANY_KWARG
+    if _AGENT_INIT_PARAMS is None:
+        try:
+            params = inspect.signature(AgentLoop.__init__).parameters
+            _AGENT_ACCEPTS_ANY_KWARG = any(
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+            _AGENT_INIT_PARAMS = set(params)
+        except (TypeError, ValueError):
+            _AGENT_INIT_PARAMS = set()
+            _AGENT_ACCEPTS_ANY_KWARG = True
+    if not _AGENT_ACCEPTS_ANY_KWARG:
+        for key in list(kwargs):
+            if key not in _AGENT_INIT_PARAMS:
+                value = kwargs.pop(key)
+                if value is not None:
+                    print(f"[CHAT] WARNING: AgentLoop does not accept '{key}'; ignoring {value!r}")
+    return AgentLoop(**kwargs)
+
+
+def _chunk_payload(chunk: ChatCompletionChunk, public_session_id: Optional[str]) -> Dict[str, Any]:
+    """Serialize a chunk; x_session_id is the real id on EVERY chunk (never null)."""
+    data = chunk.model_dump()
+    if public_session_id:
+        data["x_session_id"] = public_session_id
+    else:
+        data.pop("x_session_id", None)
+    return data
+
+
+def _sse(data: Dict[str, Any]) -> Dict[str, str]:
+    return {"data": json.dumps(data, ensure_ascii=False, default=str)}
+
+
+# ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
 
@@ -247,6 +548,10 @@ async def chat_completions(
     request: Request,
     current_user: Optional[dict] = Depends(get_optional_user),
 ):
+    lease = None
+    # Set once the streaming response owns the lease (released by the
+    # generator / background finalizer instead of this function).
+    lease_handed_off = False
     try:
         parsed = await _parse_request(request)
         messages_data = parsed["messages_data"]
@@ -269,49 +574,81 @@ async def chat_completions(
         mode = parsed["mode"]
         response_format = parsed["response_format"]
         guided_json = parsed["guided_json"]
+        ephemeral: bool = parsed["ephemeral"]
+        disable_tools: bool = parsed["disable_tools"]
+        chat_template_kwargs = parsed["chat_template_kwargs"]
+        max_tokens = parsed["max_tokens"]
         files: List[UploadFile] = parsed["files"]
         username = current_user["username"] if current_user else "guest"
 
-        chat_messages = [ChatMessage(**msg) for msg in messages_data]
+        try:
+            chat_messages = [ChatMessage(**msg) for msg in messages_data]
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid messages: {exc}")
         new_history_messages = _build_storage_messages(chat_messages)
 
         # Session handling
-        if session_id:
-            session = db.get_session(session_id)
-            if not session:
-                if session_id.startswith("hb_"):
-                    # Heartbeat sessions are auto-created on first tick of each hour
-                    db.create_session(session_id, username)
-                    db.update_session_title(session_id, f"Heartbeat {session_id[3:]}")
-                    history = []
-                elif session_id.startswith("cluster_"):
-                    # Cluster task sessions are auto-created on first use — the
-                    # slave worker names them cluster_<task_id> before any
-                    # session exists (see hoonbot/core/cluster_worker.py).
-                    db.create_session(session_id, username)
-                    db.update_session_title(session_id, f"Cluster task {session_id[8:]}")
-                    history = []
-                else:
-                    raise HTTPException(status_code=404, detail="Session not found")
-            else:
-                history = conversation_store.load_recent_conversation(session_id) or []
-        else:
-            session_id = str(uuid.uuid4())
-            db.create_session(session_id, username)
-            title = _generate_session_title(chat_messages)
-            db.update_session_title(session_id, title)
-            history = []
-
-        # Workspace selection: explicit request value (if non-empty) updates the
-        # persisted session workspace. Otherwise reuse whatever was stored on
-        # the session row. Validation lives in AgentLoop._validate_workspace —
-        # we just record whatever the caller asked for.
-        if workspace:
-            db.update_session_workspace(session_id, workspace)
+        if ephemeral:
+            # Ephemeral (C5): no history loaded, nothing persisted, no session
+            # row/file, no lease. The internal id only scopes scratch/tool
+            # artifacts for this one run and is never returned to the client.
+            session_id = f"ephemeral_{uuid.uuid4().hex[:12]}"
+            history: List[Dict[str, Any]] = []
             effective_workspace = workspace
         else:
-            session_row = db.get_session(session_id) or {}
-            effective_workspace = session_row.get("workspace_dir")
+            existing_session = False
+            if session_id:
+                _validate_session_id(session_id)
+                session = db.get_session(session_id)
+                if not session:
+                    if session_id.startswith("hb_"):
+                        # Heartbeat sessions are auto-created on first tick of each hour
+                        db.create_session(session_id, username)
+                        db.update_session_title(session_id, f"Heartbeat {session_id[3:]}")
+                    elif session_id.startswith("cluster_"):
+                        # Cluster task sessions are auto-created on first use — the
+                        # slave worker names them cluster_<task_id> before any
+                        # session exists (see hoonbot/core/cluster_worker.py).
+                        db.create_session(session_id, username)
+                        db.update_session_title(session_id, f"Cluster task {session_id[8:]}")
+                    else:
+                        raise HTTPException(status_code=404, detail="Session not found")
+                else:
+                    existing_session = True
+            else:
+                session_id = str(uuid.uuid4())
+                db.create_session(session_id, username)
+                title = _generate_session_title(chat_messages)
+                db.update_session_title(session_id, title)
+
+            # One turn per session at a time (across workers too): load ->
+            # run -> persist must not interleave with another turn or with a
+            # manual /compact rewrite.
+            lease = await conversation_store.acquire_turn_lease(
+                session_id, timeout=_LEASE_WAIT_SECONDS
+            )
+            # Any stop marker written before this turn began was aimed at an
+            # earlier run — don't let it kill this one at iteration 0.
+            clear_session_stop(session_id)
+
+            history = []
+            if existing_session:
+                history = await asyncio.to_thread(
+                    conversation_store.load_recent_conversation, session_id
+                ) or []
+
+            # Workspace selection: explicit request value (if non-empty) updates the
+            # persisted session workspace. Otherwise reuse whatever was stored on
+            # the session row. Validation lives in AgentLoop._validate_workspace —
+            # we just record whatever the caller asked for.
+            if workspace:
+                db.update_session_workspace(session_id, workspace)
+                effective_workspace = workspace
+            else:
+                session_row = db.get_session(session_id) or {}
+                effective_workspace = session_row.get("workspace_dir")
+
+        public_session_id: Optional[str] = None if ephemeral else session_id
 
         # File uploads
         file_paths: List[str] = []
@@ -324,7 +661,7 @@ async def chat_completions(
         agent_messages = list(history)
         agent_messages.extend(llm_messages)
 
-        agent = AgentLoop(
+        agent_kwargs: Dict[str, Any] = dict(
             model=model_name,
             temperature=temp,
             session_id=session_id,
@@ -334,42 +671,103 @@ async def chat_completions(
             guided_json=guided_json,
             mode=mode or "normal",
         )
+        if disable_tools:
+            # Explicit empty list = no tools at all (AgentLoop distinguishes
+            # [] from None, which means config.AVAILABLE_TOOLS).
+            agent_kwargs["tools"] = []
+        if chat_template_kwargs is not None:
+            agent_kwargs["chat_template_kwargs"] = chat_template_kwargs
+        if max_tokens is not None:
+            agent_kwargs["max_tokens"] = max_tokens
+        agent = _build_agent(**agent_kwargs)
 
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         created_timestamp = int(time.time())
+        record = _TurnRecord()
+        response_headers: Dict[str, str] = (
+            {"X-Session-Id": public_session_id} if public_session_id else {}
+        )
 
-        # Persist the user turn + whatever assistant text was produced, exactly
-        # once. Runs on normal completion AND on interruption (client
-        # disconnect, @stop, upstream error) so a long agentic turn is never
-        # lost from history — the next turn continues from here instead of
-        # restarting before this turn. Called synchronously from a finally: a
-        # create_task/to_thread scheduled during request/generator teardown may
-        # never get a chance to run.
-        _persist_state = {"done": False, "assistant": ""}
-
-        def _persist_turn():
-            if _persist_state["done"]:
+        # Persist the user turn + the assistant outcome, exactly once. Runs on
+        # normal completion AND on interruption (client disconnect, @stop,
+        # upstream error) so a long agentic turn is never lost from history.
+        # Called synchronously from a finally: a create_task/to_thread
+        # scheduled during request/generator teardown may never get to run.
+        def _persist_turn() -> None:
+            if record.persisted:
                 return
-            _persist_state["done"] = True
+            record.persisted = True
+            text = record.assistant_text
+            print(
+                f"[CHAT] turn end session={session_id} outcome={record.outcome} "
+                f"finish={record.finish_reason} chars={len(text)} tools={len(record.tools)}"
+            )
+            if record.outcome == "complete" and not text.strip():
+                print(f"[CHAT] EMPTY_REPLY session={session_id} finish={record.finish_reason}")
+            if ephemeral:
+                return
             to_store = list(new_history_messages)
-            if _persist_state["assistant"]:
-                to_store.append({"role": "assistant", "content": _persist_state["assistant"]})
+            assistant_content = record.persisted_assistant_content()
+            if assistant_content.strip():
+                to_store.append({"role": "assistant", "content": assistant_content})
             if not to_store:
                 return
             try:
                 conversation_store.append_messages(session_id, to_store)
                 db.increment_session_message_count(session_id, len(to_store))
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[CHAT] WARNING: failed to persist turn for session {session_id}: {_format_exception(exc)}")
+
+        def _finish_turn() -> None:
+            try:
+                _persist_turn()
+            finally:
+                if lease is not None:
+                    lease.release()
+
+        def _final_chunk(finish_reason: str) -> Dict[str, str]:
+            chunk = ChatCompletionChunk(
+                id=request_id,
+                created=created_timestamp,
+                model=model_name,
+                choices=[
+                    ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(),
+                        finish_reason=finish_reason,
+                    )
+                ],
+                x_session_id=public_session_id,
+            )
+            data = _chunk_payload(chunk, public_session_id)
+            data["x_diagnostics"] = _build_diagnostics(agent, record)
+            return _sse(data)
 
         if is_streaming:
             async def generate_stream():
+                # Runs the agent in its own task so a stop is enforced even
+                # while the loop is blocked in a long tool or LLM call.
+                agent_events = stop_enforced_events(
+                    agent.run_stream(agent_messages, file_metadata), session_id
+                )
                 try:
-                    assistant_message = ""
-                    async for event in agent.run_stream(agent_messages, file_metadata):
+                    # First event: the session id, before any work starts, so a
+                    # client can resume this session even if the turn later fails.
+                    first: Dict[str, Any] = {
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_timestamp,
+                        "model": model_name,
+                        "choices": [],
+                    }
+                    if public_session_id:
+                        first["x_session_id"] = public_session_id
+                    yield _sse(first)
+
+                    async for event in agent_events:
                         if isinstance(event, TextEvent):
-                            assistant_message += event.content
-                            _persist_state["assistant"] = assistant_message
+                            if not event.content:
+                                continue
+                            record.add_text(event.content)
                             chunk = ChatCompletionChunk(
                                 id=request_id,
                                 created=created_timestamp,
@@ -381,8 +779,9 @@ async def chat_completions(
                                 ],
                             )
                             # Unnamed event — parsed by standard OpenAI clients
-                            yield {"data": chunk.model_dump_json()}
+                            yield _sse(_chunk_payload(chunk, public_session_id))
                         elif isinstance(event, ToolStatusEvent):
+                            record.note_tool_status(event)
                             tool_data = json.dumps({
                                 "tool_status": {
                                     "tool_name": event.tool_name,
@@ -396,56 +795,176 @@ async def chat_completions(
                             # Named event — standard clients ignore unknown event types
                             yield {"event": "tool_status", "data": tool_data}
 
-                    # Final chunk with session_id
-                    final_chunk = ChatCompletionChunk(
-                        id=request_id,
-                        created=created_timestamp,
-                        model=model_name,
-                        choices=[
-                            ChatCompletionChunkChoice(
-                                delta=ChatCompletionChunkDelta(),
-                                finish_reason="stop",
-                            )
-                        ],
-                        x_session_id=session_id,
-                    )
-                    yield {"data": final_chunk.model_dump_json()}
+                    record.mark_complete(_agent_finish_reason(agent))
+                    yield _final_chunk(record.finish_reason)
                     yield {"data": "[DONE]"}
 
+                except StopInferenceError:
+                    record.outcome = "interrupted"
+                    record.reason = "stopped by user request"
+                    record.finish_reason = "interrupted"
+                    yield _final_chunk("interrupted")
+                    yield {"data": "[DONE]"}
                 except Exception as e:
-                    error_data = {
+                    record.outcome = "error"
+                    record.reason = f"error: {_format_exception(e)}"
+                    record.finish_reason = "error"
+                    print(f"[CHAT] ERROR session={session_id}: {_format_exception(e)}")
+                    error_data: Dict[str, Any] = {
                         "error": {
                             "message": _format_exception(e),
-                            "type": "internal_error",
-                        }
+                            "type": _error_type(e),
+                        },
+                        "x_diagnostics": _build_diagnostics(agent, record),
                     }
-                    yield {"data": json.dumps(error_data)}
+                    upstream_status = getattr(e, "status_code", None)
+                    if isinstance(upstream_status, int):
+                        error_data["error"]["code"] = upstream_status
+                    if public_session_id:
+                        error_data["x_session_id"] = public_session_id
+                    yield _sse(error_data)
+                    yield {"data": "[DONE]"}
                 finally:
                     # Fires on normal end, error, and client-disconnect
-                    # cancellation (generator aclose) alike.
-                    _persist_turn()
+                    # cancellation (generator aclose) alike. Close the agent
+                    # relay first (cancels + reaps a still-running agent).
+                    try:
+                        await agent_events.aclose()
+                    except BaseException:
+                        pass
+                    finally:
+                        _finish_turn()
 
-            return EventSourceResponse(generate_stream())
+            stream_gen = generate_stream()
+
+            async def _finalize_stream() -> None:
+                # Backstop: runs after the SSE response ends however it ended.
+                # Closing a generator suspended at a yield runs its finally
+                # (persist + lease release); both steps are idempotent.
+                try:
+                    await stream_gen.aclose()
+                except Exception:
+                    pass
+                _finish_turn()
+
+            response = EventSourceResponse(
+                stream_gen,
+                headers=response_headers,
+                ping=15,
+                background=BackgroundTask(_finalize_stream),
+            )
+            lease_handed_off = True
+            return response
 
         else:
-            try:
-                assistant_message = await agent.run(agent_messages, file_metadata)
-                _persist_state["assistant"] = assistant_message
-                return ChatCompletionResponse(
-                    id=request_id,
-                    created=created_timestamp,
-                    model=model_name,
-                    choices=[
-                        ChatCompletionChoice(
-                            message=ChatMessage(role="assistant", content=assistant_message)
-                        )
-                    ],
-                    x_session_id=session_id,
+            async def _consume() -> None:
+                agent_events = stop_enforced_events(
+                    agent.run_stream(agent_messages, file_metadata), session_id
                 )
-            finally:
+                try:
+                    async for event in agent_events:
+                        if isinstance(event, TextEvent):
+                            record.add_text(event.content)
+                        elif isinstance(event, ToolStatusEvent):
+                            record.note_tool_status(event)
+                finally:
+                    await agent_events.aclose()
+
+            agent_task = asyncio.create_task(_consume())
+            client_gone = {"value": False}
+
+            async def _watch_disconnect() -> None:
+                # Starlette doesn't cancel a plain endpoint when the client
+                # goes away; without this a timed-out caller leaves the agent
+                # burning vLLM/tool slots and persisting a turn nobody reads.
+                try:
+                    while not agent_task.done():
+                        await asyncio.sleep(_DISCONNECT_POLL_SECONDS)
+                        if agent_task.done():
+                            return
+                        try:
+                            gone = await request.is_disconnected()
+                        except Exception:
+                            return
+                        if gone:
+                            client_gone["value"] = True
+                            print(f"[CHAT] client disconnected — cancelling session={session_id}")
+                            agent_task.cancel()
+                            return
+                except asyncio.CancelledError:
+                    pass
+
+            watcher = asyncio.create_task(_watch_disconnect())
+            try:
+                await asyncio.wait({agent_task})
+            except asyncio.CancelledError:
+                # The request handler itself was cancelled (server shutdown):
+                # stop the agent too, record the interruption, re-raise.
+                agent_task.cancel()
+                watcher.cancel()
+                record.reason = "request cancelled"
+                try:
+                    await asyncio.wait({agent_task}, timeout=5)
+                except BaseException:
+                    pass
                 _persist_turn()
+                raise
+            watcher.cancel()
+
+            if agent_task.cancelled():
+                record.reason = "client disconnected" if client_gone["value"] else "run cancelled"
+                _persist_turn()
+                return JSONResponse(
+                    status_code=499,
+                    content={"detail": "client disconnected", "x_session_id": public_session_id},
+                    headers=response_headers,
+                )
+
+            exc = agent_task.exception()
+            if exc is None:
+                record.mark_complete(_agent_finish_reason(agent))
+            elif isinstance(exc, StopInferenceError):
+                record.outcome = "interrupted"
+                record.reason = "stopped by user request"
+                record.finish_reason = "interrupted"
+            else:
+                record.outcome = "error"
+                record.reason = f"error: {_format_exception(exc)}"
+                record.finish_reason = "error"
+                print(f"[CHAT] ERROR session={session_id}: {_format_exception(exc)}")
+                _persist_turn()
+                raise HTTPException(
+                    status_code=502 if isinstance(exc, VllmStreamError) else 500,
+                    detail=_format_exception(exc),
+                    headers=response_headers or None,
+                )
+            _persist_turn()
+
+            body = ChatCompletionResponse(
+                id=request_id,
+                created=created_timestamp,
+                model=model_name,
+                choices=[
+                    ChatCompletionChoice(
+                        message=ChatMessage(role="assistant", content=record.assistant_text),
+                        finish_reason=record.finish_reason,
+                    )
+                ],
+                x_session_id=public_session_id or "",
+            ).model_dump()
+            body["x_session_id"] = public_session_id
+            body["x_diagnostics"] = _build_diagnostics(agent, record)
+            return JSONResponse(content=body, headers=response_headers)
 
     except HTTPException:
         raise
+    except SessionBusyError:
+        raise HTTPException(status_code=409, detail="session busy")
+    except FileLockTimeout:
+        raise HTTPException(status_code=503, detail="session storage busy")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[CHAT] ERROR (setup): {_format_exception(e)}")
+        raise HTTPException(status_code=500, detail=_format_exception(e))
+    finally:
+        if lease is not None and not lease_handed_off:
+            lease.release()

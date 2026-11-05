@@ -46,6 +46,17 @@ class WebSearchTool:
         Returns:
             Dict with raw Tavily results
         """
+        if getattr(config, "AIRGAPPED", True):
+            # No outbound internet: fail fast instead of hanging on a connect timeout.
+            return {
+                "success": False,
+                "error": "websearch is disabled: this deployment is airgapped (no internet access)",
+                "hint": "Use local files (file_reader/grep/file_navigator), uploaded documents (rag), or ask the user.",
+                "query": query,
+                "results": [],
+                "num_results": 0,
+            }
+
         # Log to file
         log_to_prompts_file("\n\n")
         log_to_prompts_file("=" * 80)

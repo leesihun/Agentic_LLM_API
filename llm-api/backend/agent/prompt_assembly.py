@@ -20,8 +20,25 @@ from backend.agent._cache import (
 # Module-level caches for environment context (avoids spawning subprocesses every iteration)
 _env_git_cache: Dict[str, Any] = {}
 _env_files_cache: Dict[str, Any] = {}
+_repo_doc_cache: Dict[str, Any] = {}  # resolved path -> {"mtime", "size", "text"}
 _ENV_GIT_TTL = 30   # seconds
 _ENV_FILES_TTL = 60 # seconds
+
+# Git context: per-command timeout and a total budget across the three calls,
+# so a huge / network-mounted repo can't stall request start-up.
+_GIT_CMD_TIMEOUT = 3.0
+_GIT_TOTAL_BUDGET = 5.0
+
+# Recent-files walk bounds. The old unbounded rglob walked node_modules/data
+# trees before filtering them out — seconds of blocking IO on a large workspace.
+_WALK_PRUNE = {
+    ".git", "__pycache__", "node_modules", "data", ".venv", "venv", "dist",
+    "dist-web", "build", ".mypy_cache", ".pytest_cache", ".tox", ".idea",
+    ".cache", "models", "offline_models",
+}
+_WALK_MAX_DEPTH = 4
+_WALK_MAX_ENTRIES = 5000
+_WALK_TIME_BUDGET = 1.5  # seconds
 
 
 def _get_git_context(cwd: str) -> str:
@@ -32,16 +49,30 @@ def _get_git_context(cwd: str) -> str:
 
     lines = []
     git_dir = Path(cwd) / ".git"
-    if not git_dir.exists():
+    try:
+        is_repo = git_dir.exists()
+    except OSError:
+        is_repo = False
+    if not is_repo:
         text = ""
         _env_git_cache[cwd] = {"text": text, "expires_at": time.time() + _ENV_GIT_TTL}
         return text
 
+    deadline = time.monotonic() + _GIT_TOTAL_BUDGET
+    env = dict(os.environ)
+    env["GIT_OPTIONAL_LOCKS"] = "0"      # never take index.lock for a read
+    env["GIT_TERMINAL_PROMPT"] = "0"     # never block on credentials
+
     def _run(args):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.2:
+            return ""
         try:
             r = subprocess.run(
-                args, cwd=cwd, capture_output=True, text=True, timeout=3,
-                encoding="utf-8", errors="replace",
+                args, cwd=cwd, capture_output=True, text=True,
+                timeout=min(_GIT_CMD_TIMEOUT, remaining),
+                encoding="utf-8", errors="replace", env=env,
+                stdin=subprocess.DEVNULL,
             )
             return r.stdout.strip() if r.returncode == 0 else ""
         except Exception:
@@ -65,29 +96,51 @@ def _get_git_context(cwd: str) -> str:
 
 
 def _get_recent_files(cwd: str) -> str:
-    """Return recently-modified files (last 24h). Cached 60s."""
+    """Return recently-modified files (last 24h). Cached 60s.
+
+    Bounded walk: prunes heavy/vendored directories BEFORE descending, stops at
+    _WALK_MAX_DEPTH, _WALK_MAX_ENTRIES files, or _WALK_TIME_BUDGET seconds.
+    """
     cached = _env_files_cache.get(cwd)
     if cached and time.time() < cached["expires_at"]:
         return cached["text"]
 
-    EXCLUDE = {".git", "__pycache__", "node_modules", "data", ".venv", "venv"}
     now = time.time()
     cutoff = now - 86400  # 24h
+    deadline = time.monotonic() + _WALK_TIME_BUDGET
     recent = []
+    seen = 0
     try:
-        for p in Path(cwd).rglob("*"):
-            if any(part in EXCLUDE for part in p.parts):
-                continue
-            if not p.is_file():
-                continue
-            try:
-                if p.stat().st_mtime >= cutoff:
+        root_depth = len(Path(cwd).parts)
+        for dirpath, dirnames, filenames in os.walk(cwd, topdown=True, onerror=lambda e: None):
+            depth = len(Path(dirpath).parts) - root_depth
+            # Prune in place so os.walk never descends into excluded trees.
+            if depth >= _WALK_MAX_DEPTH:
+                dirnames[:] = []
+            else:
+                dirnames[:] = [
+                    d for d in dirnames
+                    if d not in _WALK_PRUNE and not d.startswith(".")
+                ]
+            stop = False
+            for fname in filenames:
+                seen += 1
+                if seen > _WALK_MAX_ENTRIES or time.monotonic() > deadline:
+                    stop = True
+                    break
+                full = os.path.join(dirpath, fname)
+                try:
+                    mtime = os.stat(full).st_mtime
+                except OSError:
+                    continue
+                if mtime >= cutoff:
                     try:
-                        recent.append((p.stat().st_mtime, str(p.relative_to(cwd))))
+                        rel = os.path.relpath(full, cwd)
                     except ValueError:
-                        recent.append((p.stat().st_mtime, str(p)))
-            except OSError:
-                continue
+                        rel = full
+                    recent.append((mtime, rel.replace("\\", "/")))
+            if stop:
+                break
     except Exception:
         pass
 
@@ -95,6 +148,30 @@ def _get_recent_files(cwd: str) -> str:
     top = [name for _, name in recent[:10]]
     text = "Recently modified:\n" + "\n".join(top) if top else ""
     _env_files_cache[cwd] = {"text": text, "expires_at": time.time() + _ENV_FILES_TTL}
+    return text
+
+
+def _read_repo_doc_cached(path: Path) -> Optional[str]:
+    """Read a repo instruction doc, cached on (mtime, size). None if unreadable."""
+    key = str(path)
+    try:
+        st = path.stat()
+    except OSError:
+        _repo_doc_cache.pop(key, None)
+        return None
+    cached = _repo_doc_cache.get(key)
+    if cached and cached["mtime"] == st.st_mtime and cached["size"] == st.st_size:
+        return cached["text"]
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return None
+    except Exception:
+        return None
+    _repo_doc_cache[key] = {"mtime": st.st_mtime, "size": st.st_size, "text": text}
     return text
 
 
@@ -250,20 +327,42 @@ class PromptMixin:
 
         sections = []
         remaining = cap
-        for path in self._repo_doc_candidates():
-            if remaining <= 0 or not path.exists() or not path.is_file():
-                continue
+        ws = getattr(self, "workspace_dir", None)
+        bases: List[Path] = []
+        if ws:
             try:
-                text = path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                text = path.read_text(encoding="utf-8", errors="replace")
+                bases.append(Path(ws).resolve())
             except Exception:
+                pass
+        try:
+            bases.append(config.APP_DIR.parent.resolve())
+        except Exception:
+            pass
+        for path in self._repo_doc_candidates():
+            if remaining <= 0:
+                break
+            try:
+                if not path.is_file():
+                    continue
+            except OSError:
                 continue
-            if not text.strip():
+            text = _read_repo_doc_cached(path)
+            if not text or not text.strip():
                 continue
 
-            rel = path.relative_to(config.APP_DIR.parent.resolve())
-            header = f"\n### {rel.as_posix()}\n"
+            # Workspace docs live outside the API repo: relative_to() would raise
+            # ValueError there. Prefer the workspace base, then the API repo,
+            # then the absolute path.
+            label = None
+            for base in bases:
+                try:
+                    label = path.relative_to(base).as_posix()
+                    break
+                except ValueError:
+                    continue
+            if label is None:
+                label = path.as_posix()
+            header = f"\n### {label}\n"
             budget = remaining - len(header)
             if budget <= 0:
                 break

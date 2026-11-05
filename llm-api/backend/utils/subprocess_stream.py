@@ -1,21 +1,23 @@
 """
 Asynchronous subprocess execution with incremental output streaming.
 
-Shared helper used by code_exec so it streams stdout/stderr chunk-by-chunk
-with a shared memory cap. Keeps the writing process unblocked by continuing to read
-past the cap (excess bytes are dropped, not stored).
+Shared helper used by code_exec. Thin compatibility wrapper over
+backend.utils.proc_lifecycle.run_process, which owns the hardened lifecycle:
+new process group/session, stdin=DEVNULL, non-interactive env, tree kill on
+timeout AND on cancellation, bounded wait/drains (a background child holding
+the pipes can no longer hang the call), and head+tail output capture.
 
 Two optional kill triggers (beyond normal exit):
   - wall-clock timeout  : process runs longer than `timeout` seconds total.
-                          Disabled when `timeout` is None or <= 0.
-  - idle-stdout timeout : process produces no stdout for `idle_timeout` seconds
-                          (catches hangs that produce no output).
+                          Disabled when `timeout` is None or <= 0 (callers
+                          are expected to always pass a finite timeout).
+  - idle-output timeout : process produces no stdout/stderr for
+                          `idle_timeout` seconds (catches silent hangs).
 """
-import asyncio
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Dict, List, Optional
 
-_READ_CHUNK = 4096
+from backend.utils import proc_lifecycle
 
 
 @dataclass
@@ -24,129 +26,55 @@ class StreamResult:
     stderr: str
     returncode: int
     timed_out: bool = False
-    idle_killed: bool = False   # True when killed for stdout silence, not wall-clock
-
-
-async def _drain_into(
-    stream: asyncio.StreamReader,
-    buf: bytearray,
-    max_bytes: int,
-) -> None:
-    """Drain *stream* into *buf*, capping stored bytes at max_bytes."""
-    truncated = False
-    while True:
-        chunk = await stream.read(_READ_CHUNK)
-        if not chunk:
-            return
-        if truncated:
-            continue
-        room = max_bytes - len(buf)
-        if room > 0:
-            buf.extend(chunk[:room])
-        if len(buf) >= max_bytes and not truncated:
-            buf.extend(b"\n...[truncated]")
-            truncated = True
-
-
-async def _drain_tracking(
-    stream: asyncio.StreamReader,
-    buf: bytearray,
-    max_bytes: int,
-    last_seen: list,  # single-element list used as mutable float ref
-) -> None:
-    """Like _drain_into but updates last_seen[0] on every received chunk."""
-    truncated = False
-    while True:
-        chunk = await stream.read(_READ_CHUNK)
-        if not chunk:
-            return
-        last_seen[0] = asyncio.get_running_loop().time()
-        if truncated:
-            continue
-        room = max_bytes - len(buf)
-        if room > 0:
-            buf.extend(chunk[:room])
-        if len(buf) >= max_bytes and not truncated:
-            buf.extend(b"\n...[truncated]")
-            truncated = True
+    idle_killed: bool = False   # True when killed for output silence, not wall-clock
+    pid: Optional[int] = None
+    stdout_omitted: int = 0     # bytes dropped from the middle (head+tail kept)
+    stderr_omitted: int = 0
+    drain_incomplete: bool = False
+    duration: float = 0.0
+    notes: List[str] = field(default_factory=list)
 
 
 async def run_streaming(
     program: str,
-    args: list[str],
+    args: List[str],
     cwd: str,
-    timeout: Optional[int],
+    timeout: Optional[float],
     max_output_size: int,
-    idle_timeout: Optional[int] = None,
+    idle_timeout: Optional[float] = None,
+    env: Optional[Dict[str, str]] = None,
+    head_bytes: Optional[int] = None,
+    tail_bytes: Optional[int] = None,
 ) -> StreamResult:
     """Run a program asynchronously, streaming both stdout and stderr.
 
-    Killed when either the wall-clock `timeout` expires OR `idle_timeout`
-    seconds pass with no new stdout bytes (whichever fires first). Pass
-    timeout=None or timeout<=0 to disable the wall-clock kill trigger.
-    Returns whatever was streamed up to that point (timed_out=True).
+    Killed (whole process tree) when either the wall-clock `timeout` expires
+    OR `idle_timeout` seconds pass with no new output (whichever fires first).
+    Returns whatever was streamed up to that point (timed_out=True). Output is
+    kept head+tail, each part bounded by `max_output_size`.
     """
-    proc = await asyncio.create_subprocess_exec(
-        program,
-        *args,
+    cap = max(1, int(max_output_size or 1))
+    head = min(cap, head_bytes or proc_lifecycle.DEFAULT_HEAD_BYTES)
+    tail = min(cap, tail_bytes or proc_lifecycle.DEFAULT_TAIL_BYTES)
+    res = await proc_lifecycle.run_process(
+        [program, *args],
         cwd=cwd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+        env=env if env is not None else proc_lifecycle.child_env(),
+        timeout=timeout,
+        idle_timeout=idle_timeout,
+        head_bytes=head,
+        tail_bytes=tail,
     )
-
-    loop = asyncio.get_running_loop()
-    stdout_buf = bytearray()
-    stderr_buf = bytearray()
-    last_stdout = [loop.time()]  # updated by _drain_tracking
-
-    stdout_task = asyncio.create_task(
-        _drain_tracking(proc.stdout, stdout_buf, max_output_size, last_stdout)
-    )
-    stderr_task = asyncio.create_task(
-        _drain_into(proc.stderr, stderr_buf, max_output_size)
-    )
-
-    proc_task = asyncio.create_task(proc.wait())
-    deadline = None if timeout is None or timeout <= 0 else loop.time() + timeout
-
-    def _decode():
-        return (
-            bytes(stdout_buf).decode('utf-8', errors='replace'),
-            bytes(stderr_buf).decode('utf-8', errors='replace'),
-        )
-
-    async def _kill_and_drain(idle: bool) -> StreamResult:
-        proc_task.cancel()
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        try:
-            await proc.wait()
-        except Exception:
-            pass
-        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
-        out, err = _decode()
-        return StreamResult(
-            stdout=out, stderr=err,
-            returncode=-1, timed_out=True, idle_killed=idle,
-        )
-
-    # Poll every second; check both kill conditions.
-    while not proc_task.done():
-        done, _ = await asyncio.wait({proc_task}, timeout=1.0)
-        if proc_task in done:
-            break
-        now = loop.time()
-        if deadline is not None and now >= deadline:
-            return await _kill_and_drain(idle=False)
-        if idle_timeout is not None and (now - last_stdout[0]) >= idle_timeout:
-            return await _kill_and_drain(idle=True)
-
-    await asyncio.gather(stdout_task, stderr_task)
-    out, err = _decode()
     return StreamResult(
-        stdout=out,
-        stderr=err,
-        returncode=proc.returncode if proc.returncode is not None else -1,
+        stdout=res.stdout,
+        stderr=res.stderr,
+        returncode=-1 if res.timed_out else res.returncode,
+        timed_out=res.timed_out,
+        idle_killed=res.idle_killed,
+        pid=res.pid,
+        stdout_omitted=res.stdout_omitted,
+        stderr_omitted=res.stderr_omitted,
+        drain_incomplete=res.drain_incomplete,
+        duration=res.duration,
+        notes=list(res.notes),
     )

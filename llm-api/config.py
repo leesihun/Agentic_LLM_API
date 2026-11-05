@@ -65,8 +65,16 @@ _CLUSTER = _load_cluster_config()
 # ============================================================================
 SERVER_HOST = getattr(_CLUSTER, "LLM_API_BIND_HOST", "0.0.0.0")
 SERVER_PORT = int(getattr(_CLUSTER, "LLM_API_PORT", 10002))
-SERVER_WORKERS = 2
+# Keep at 1: per-process state (process_monitor registry, learned context
+# window / prompt-token calibration, subagent semaphore, session turn locks,
+# RAG model singletons) is NOT shared across workers. Throughput comes from
+# async concurrency; vLLM does the batching.
+SERVER_WORKERS = 1
 LOG_LEVEL = "INFO"
+
+# Airgapped deployment (no outbound internet). When True, websearch is removed
+# from AVAILABLE_TOOLS (and from subagent tool lists). Edit in cluster_config.py.
+AIRGAPPED = str(getattr(_CLUSTER, "AIRGAPPED", True)).strip().lower() in ("1", "true", "yes", "on")
 
 # ============================================================================
 # vLLM Backend
@@ -103,17 +111,21 @@ DEFAULT_TOP_K = 40
 DEFAULT_MIN_P = 0.0
 # Per-turn OUTPUT token ceiling. On a reasoning model at high/max effort the
 # hidden <think> block alone can eat thousands of tokens, so a small cap here
-# truncates the turn mid-thought or mid-tool-call (the call is then suppressed —
-# see llm_backend _extract_leaked_tool_calls — and the turn silently ends). The
-# served model window is 200k, so keep headroom. vLLM allocates
-# KV incrementally, so a high ceiling costs nothing unless actually generated;
-# it only needs prompt_tokens + max_tokens <= the served model's max_model_len.
+# truncates the turn mid-thought or mid-tool-call (the loop then auto-continues,
+# see AGENT_MAX_TRUNCATION_CONTINUATIONS). The served window is 1M tokens, so
+# there is ample headroom. vLLM allocates KV incrementally, so a high ceiling
+# costs nothing unless actually generated; it only needs
+# prompt_tokens + max_tokens <= the served model's max_model_len.
+# Never set below 32768 (reasoning at max effort + a large tool call).
 DEFAULT_MAX_TOKENS = 100000
 # max_tokens above is only a ceiling: llm_backend._fit_max_tokens shrinks it per
-# request to (MODEL_CONTEXT_WINDOW - estimated prompt - margin), so a big output
-# ceiling does not reduce how much prompt can be sent. Floor = never request less.
-MAX_TOKENS_SAFETY_MARGIN = 2048
-MIN_OUTPUT_TOKENS = 1024
+# request to (effective window - estimated prompt - margin), so a big output
+# ceiling does not reduce how much prompt can be sent. MIN_OUTPUT_TOKENS is the
+# floor: a reasoning model cannot produce a usable answer in ~1k tokens, so when
+# the headroom drops below this the agent compacts instead of sending a starved
+# request. The margin absorbs prompt-token estimation error at 1M scale.
+MAX_TOKENS_SAFETY_MARGIN = 8192
+MIN_OUTPUT_TOKENS = 8192
 DEFAULT_REPETITION_PENALTY = 1.0   # vLLM's field is `repetition_penalty` (1.0 = no penalty)
 
 # Per-model temperature overrides (substring match on model name, lowercase).
@@ -144,18 +156,41 @@ CHAT_TEMPLATE_KWARGS = {"reasoning_effort": "max"}
 # per-request field, so there is no cache_prompt knob here. The agent still
 # keeps its system-prompt prefix byte-stable (see prompt_assembly) so vLLM's
 # automatic prefix cache hits across iterations.
-VLLM_CONNECTION_POOL_SIZE = 20
+#
+# httpx connection pool to vLLM (one process-wide client shared by parent loops,
+# subagents, compaction and cluster turns). Each streaming generation holds a
+# connection for its whole duration, so this must comfortably exceed the number
+# of concurrent generations; the pool timeout is None (wait, don't error).
+VLLM_POOL_MAX_CONNECTIONS = 128
+VLLM_CONNECTION_POOL_SIZE = VLLM_POOL_MAX_CONNECTIONS  # legacy alias
+# Hard bound on in-flight HTTP requests to vLLM from this process (an
+# asyncio.Semaphore around each backend call). Excess requests queue instead of
+# failing. Size it near vLLM's --max-num-seqs. Edit in cluster_config.py.
+VLLM_MAX_CONCURRENT_REQUESTS = int(getattr(_CLUSTER, "VLLM_MAX_CONCURRENT_REQUESTS", 64))
+# Backend retries (with backoff) of a vLLM call that failed BEFORE any output
+# was yielded (transport error, 5xx, in-band error chunk). After partial output
+# the backend raises VllmStreamError(partial=True) and the agent loop continues.
+VLLM_STREAM_MAX_RETRIES = 2
 
-# vLLM streaming idle timeout (seconds). This is an INTER-CHUNK (httpx read)
-# timeout, not a total-turn cap: it only fires when vLLM sends NO bytes for this
-# long, so a healthy turn that keeps streaming tokens — however long — is never
-# cut off, while a genuine stall (GPU wedged / stream hung) is killed so the
-# agent loop errors out instead of hanging forever and pinning a cluster slot.
-# Must exceed worst-case time-to-first-token under load (requests queued behind
-# others on a busy vLLM). None = never time out (old behaviour). 1200s = 20 min.
-STREAM_READ_TIMEOUT = 1200
+# ---------------------------------------------------------------------------
+# vLLM streaming timeouts (single definition — do not redefine further down).
+# ---------------------------------------------------------------------------
+# With speculative decoding (MTP) the stream is bursty: several tokens per
+# delta, then pauses. So the stall guards are applied per chunk via
+# asyncio.wait_for around the line iterator, not as a tiny httpx read timeout:
+#  - FIRST_BYTE: time allowed until the first chunk arrives. Covers queueing
+#    behind other requests plus cold prefill of a near-1M-token prompt.
+#  - IDLE: max silence BETWEEN chunks once output has started. A healthy turn
+#    that keeps streaming — however long — is never cut off; a wedged stream
+#    (GPU hang, spec-decode stall, dead socket) is killed instead of hanging
+#    forever and pinning a pool slot / cluster slot.
+STREAM_FIRST_BYTE_TIMEOUT_SECONDS = 1800
+STREAM_IDLE_TIMEOUT_SECONDS = 300
 # Finite connect timeout so a dead vLLM fails fast rather than hanging.
 STREAM_CONNECT_TIMEOUT = 10.0
+# Legacy alias: httpx per-read ceiling. Must be >= the first-byte timeout so the
+# httpx layer never fires before the wait_for-based guards above.
+STREAM_READ_TIMEOUT = STREAM_FIRST_BYTE_TIMEOUT_SECONDS
 
 # ============================================================================
 # Logging Settings (before Agent — agent log target references PROMPTS_LOG_PATH)
@@ -180,13 +215,26 @@ AGENT_GOAL_MODE_PROMPT = "agent/goal_mode.txt"
 # sub-loop from blocking the parent's tool call indefinitely. AGENT_MAX_ITERATIONS
 # only bounds iteration count; this bounds total time.
 SUBAGENT_TIMEOUT_SECONDS = 1800
-# Hard upper bound on the `timeout` argument the LLM may pass to shell_exec.
-# The model can still request lower values; this only clamps obvious mistakes
-# (e.g. timeout=86400) that would let a runaway command wedge the agent loop.
+# Subagent fan-out (`agent` tool). Several `agent` calls in ONE assistant
+# message run concurrently. SUBAGENT_MAX_CONCURRENT is a process-wide cap
+# (module-level semaphore shared by all sessions; edit in cluster_config.py);
+# SUBAGENT_MAX_PER_TURN caps how many children one parent turn runs at once —
+# excess calls are queued, not rejected. Children use SUBAGENT_REASONING_EFFORT
+# (GLM-5.2 "max" | "high") — "high" keeps fan-out latency reasonable.
+SUBAGENT_MAX_CONCURRENT = int(getattr(_CLUSTER, "SUBAGENT_MAX_CONCURRENT", 32))
+SUBAGENT_MAX_PER_TURN = 16
+SUBAGENT_REASONING_EFFORT = "high"
+# shell_exec / code_exec timeouts (seconds). The default applies when the model
+# omits `timeout` or passes timeout<=0 (0 means "default", never "infinite").
+# The hard caps clamp obvious mistakes (e.g. timeout=86400) so a runaway or
+# blocked command (input(), plt.show(), waiting on the network in an airgap)
+# cannot wedge the agent loop. Long jobs belong in process_monitor.
+SHELL_DEFAULT_TIMEOUT_SECONDS = 300
 SHELL_EXEC_HARD_CAP_SECONDS = 3600
-# Output ceiling for intermediate tool-loop turns. Same rationale as
-# DEFAULT_MAX_TOKENS — must fit reasoning + tool-call args without truncation.
-AGENT_TOOL_LOOP_MAX_TOKENS = 100000
+CODE_EXEC_DEFAULT_TIMEOUT_SECONDS = 300
+CODE_EXEC_HARD_CAP_SECONDS = 1800
+# (Agent tool-loop and final turns share DEFAULT_MAX_TOKENS as their output
+# ceiling, or the request's max_tokens when one is given.)
 # Reasoning effort for the agent loop (GLM-5.2: "max" | "high"). "max" = deepest
 # chain-of-thought (best for complex/agentic work); "high" trades some depth for
 # lower latency across a multi-iteration loop. Truncation is handled by the token
@@ -196,38 +244,66 @@ AGENT_TOOL_LOOP_MAX_TOKENS = 100000
 # actually branches on these reasoning_effort values — verify against the model.
 AGENT_REASONING_EFFORT = "max"
 # Max times a single run may auto-continue after an output truncation
-# (finish_reason=length) before giving up — bounds runaway while ensuring a
-# cut-off turn is resumed instead of silently ending. See agent/loop.py.
-AGENT_MAX_TRUNCATION_CONTINUATIONS = 3
+# (finish_reason=length, or a vLLM stream that broke after partial output)
+# before giving up — bounds runaway while ensuring a cut-off turn is resumed
+# instead of silently ending. The counter resets after any non-truncated
+# iteration. When the cap is hit the user sees a visible truncation notice.
+AGENT_MAX_TRUNCATION_CONTINUATIONS = 6
+# Output ceiling for the "write the final answer now" retry that runs when an
+# iteration ends with no text and no tool calls (prevents bare "완료." replies).
+AGENT_FINAL_ANSWER_RETRY_MAX_TOKENS = 4096
 AGENT_SYSTEM_PROMPT = "system.txt"
-AGENT_DYNAMIC_CONTEXT_MAX_CHARS = 12000
+AGENT_DYNAMIC_CONTEXT_MAX_CHARS = 24000
 AGENT_REPO_DOC_CONTEXT_MAX_CHARS = 6000
 AGENT_MEMO_MAX_CHARS = 2000
 AGENT_FILE_PREVIEW_MAX_CHARS = 120
 AGENT_OLD_TOOL_RESULT_SUMMARY_MAX_CHARS = 4000  # MiniMax M2 / Qwen3 handle long context fine; aggressive compaction was erasing useful detail
-AGENT_COMPACTION_WARM_WINDOW = 10  # multi-file edit flows need more headroom than 5
+# Microcompaction keeps the most recent N iterations' tool results verbatim.
+AGENT_COMPACTION_WARM_WINDOW = 20
+AGENT_MICROCOMPACT_WARM_WINDOW = AGENT_COMPACTION_WARM_WINDOW  # alias
+
+# Context window (tokens) = vLLM --max-model-len (prompt + output). Set in
+# cluster_config.py (default 1_000_000); env MODEL_CONTEXT_WINDOW overrides.
+# 0 = auto-detect from vLLM /v1/models at startup. The backend's EFFECTIVE
+# window is min(this, vLLM's reported max_model_len) — detected lazily and
+# cached (TTL), so a config value larger than what vLLM actually serves can
+# never produce oversize requests; a smaller config value deliberately caps it.
+def _context_window_setting() -> int:
+    """Configured window; a blank/invalid env value falls back instead of crashing import."""
+    fallback = getattr(_CLUSTER, "MODEL_CONTEXT_WINDOW", 1_000_000)
+    raw = (os.environ.get("MODEL_CONTEXT_WINDOW") or "").strip()
+    for candidate in (raw, fallback, 1_000_000):
+        try:
+            return max(0, int(str(candidate).replace("_", "")))
+        except (TypeError, ValueError):
+            continue
+    return 1_000_000
+
+
+MODEL_CONTEXT_WINDOW = _context_window_setting()
 
 # Proactive compaction: when vLLM reports REAL prompt-token usage (via
 # stream_options.include_usage) and the last call's prompt crossed
-# MODEL_CONTEXT_WINDOW * AGENT_COMPACT_AT_TOKEN_FRACTION, the agent summarizes
-# the older half BEFORE the next send — avoiding the reactive 400-then-resend.
-# MODEL_CONTEXT_WINDOW comes from cluster_config.py (= vLLM --max-model-len, 200k);
-# 0 means auto-detect from vLLM at startup.
-# vLLM rejects a request unless prompt_tokens + max_tokens <= max_model_len, so the
-# trigger must fire while there is still room for one more iteration's growth:
-#   200k window, 100k output ceiling: compact at 100k prompt (0.5) so the full
-# ceiling still fits; past that _fit_max_tokens trims the output ceiling to fit.
-MODEL_CONTEXT_WINDOW = int(os.environ.get("MODEL_CONTEXT_WINDOW", getattr(_CLUSTER, "MODEL_CONTEXT_WINDOW", 0)))
-AGENT_COMPACT_AT_TOKEN_FRACTION = 0.5
+# effective_window * AGENT_COMPACT_AT_TOKEN_FRACTION, the agent summarizes the
+# older half BEFORE the next send — avoiding the reactive 400-then-resend.
+# vLLM rejects a request unless prompt_tokens + max_tokens <= max_model_len, so
+# the trigger must leave room for one more iteration's growth plus output:
+#   1M window: compact at 750k prompt (0.75); 750k + 100k output ceiling + margin
+#   still fits. Past that _fit_max_tokens trims the output ceiling to fit.
+# After a compaction the agent won't compact again until the prompt grows by
+# >= 10% of the window (hysteresis).
+AGENT_COMPACT_AT_TOKEN_FRACTION = 0.75
 
 # Auto-compact: also triggered reactively when vLLM returns a context-overflow
 # error. We summarize the older half of the conversation via a single LLM call
-# and replace it with a compact system message, then retry.
+# (thinking disabled, so the budget goes to the summary) and replace it with a
+# compact system message, then retry. If the summarizer fails, a deterministic
+# extractive summary is used — history is never dropped without a summary.
 AGENT_AUTOCOMPACT_ENABLED = True
-AGENT_AUTOCOMPACT_MAX_RETRIES = 2          # number of summarize-and-retry attempts per LLM call
-AGENT_AUTOCOMPACT_SUMMARY_MAX_TOKENS = 1500 # cap on the summary the LLM is allowed to emit
-AGENT_AUTOCOMPACT_PER_MSG_CHARS = 1500     # truncate each old message to this before summarizing
-AGENT_AUTOCOMPACT_KEEP_RECENT = 8          # always keep this many most-recent non-system msgs verbatim
+AGENT_AUTOCOMPACT_MAX_RETRIES = 2           # number of summarize-and-retry attempts per LLM call
+AGENT_AUTOCOMPACT_SUMMARY_MAX_TOKENS = 8000 # cap on the summary the LLM is allowed to emit
+AGENT_AUTOCOMPACT_PER_MSG_CHARS = 4000      # truncate each old message to this before summarizing
+AGENT_AUTOCOMPACT_KEEP_RECENT = 16          # always keep this many most-recent non-system msgs verbatim
 AGENT_LOG_VERBOSITY: Literal["off", "summary", "debug"] = "summary"
 AGENT_LOG_ASYNC = True
 AGENT_LOG_PATH = PROMPTS_LOG_PATH
@@ -241,7 +317,7 @@ AGENT_LOG_PATH = PROMPTS_LOG_PATH
 # Inline attached-file contents into the dynamic context when total size
 # (across all attached files) is <= this budget. Above the budget, only the
 # metadata preview is included.
-AGENT_ATTACHED_FILE_INLINE_BUDGET = 8000
+AGENT_ATTACHED_FILE_INLINE_BUDGET = 32000
 
 # ----------------------------------------------------------------------------
 # Agent: anti-spiral / reflection
@@ -306,8 +382,8 @@ STOP_FILE = DATA_DIR / "STOP"
 # ============================================================================
 # Tools Settings
 # ============================================================================
-AVAILABLE_TOOLS = [
-    "websearch",
+_ALL_TOOLS = [
+    "websearch",        # Tavily web search — dropped when AIRGAPPED
     "code_exec",        # Direct Python execution — write and run the code yourself
     "rag",              # FAISS vector search over uploaded documents
     "file_reader",      # Read any file (prefer over shell_exec cat/head/tail)
@@ -323,43 +399,54 @@ AVAILABLE_TOOLS = [
     "todo_write",       # Session task checklist (3+ step tasks)
     "agent",            # Spawn explore/general subagent in fresh context
 ]
-# Truncated tool results include their disk path in the truncation marker;
-# file_reader handles retrieval.
+# Enabled tools for a normal request (a request with disable_tools=true gets none).
+AVAILABLE_TOOLS = [name for name in _ALL_TOOLS if not (AIRGAPPED and name == "websearch")]
+# Truncated tool results include their ABSOLUTE disk path in the truncation
+# marker; file_reader handles retrieval.
 
+# Per-tool defaults applied when the model omits a parameter. Timeouts here are
+# the DEFAULT, not a cap (caps: SHELL_EXEC_HARD_CAP_SECONDS /
+# CODE_EXEC_HARD_CAP_SECONDS above).
 TOOL_PARAMETERS = {
     "code_exec": {
-        "timeout": 864000,
+        "timeout": CODE_EXEC_DEFAULT_TIMEOUT_SECONDS,
     },
     "rag": {
         "temperature": 0.2,
         "max_tokens": 30000,
     },
     "shell_exec": {
-        "timeout": 864000,
+        "timeout": SHELL_DEFAULT_TIMEOUT_SECONDS,
     },
 }
 
 # ============================================================================
 # Microcompaction: Tool Result Budgets (chars)
 # ============================================================================
+# Max chars of a tool result fed back to the model inline. Larger results are
+# spilled raw to data/tool_results/ and previewed head+tail with the absolute
+# spill path. Sized for a 1M window: big enough that the model rarely has to
+# re-read a spill, small enough that one noisy command can't flood the context.
 TOOL_RESULT_BUDGET = {
-    "websearch": 2000,
-    "code_exec": 8000,
-    "rag": 3000,
-    "file_reader": 8000,   # was 4000; .ps1/.sh scripts can be 300-800 lines
-    "file_edit": 1500,     # was 500; failed-edit diffs need to be readable
-    "apply_patch": 2000,   # V4A patch tool
-    "file_writer": 500,
-    "file_navigator": 2000,
-    "grep": 6000,          # was 4000; multi-file context windows
-    "shell_exec": 3000,
-    "shell_lint": 4000,    # new shell linting tool
-    "process_monitor": 3000,
-    "memo": 1000,
-    "todo_write": 300,
-    "agent": 6000,
+    "websearch": 8000,
+    "code_exec": 24000,
+    "rag": 12000,
+    "file_reader": 40000,
+    "file_edit": 4000,     # failed-edit diffs need to be readable
+    "apply_patch": 4000,   # V4A patch tool
+    "file_writer": 2000,
+    "file_navigator": 8000,
+    "grep": 20000,
+    "shell_exec": 16000,
+    "shell_lint": 8000,
+    "process_monitor": 12000,
+    "memo": 2000,
+    "todo_write": 2000,
+    "agent": 16000,        # subagent final report (head+tail kept)
+    "default": 8000,
 }
-TOOL_RESULT_DEFAULT_BUDGET = 3000
+TOOL_RESULT_DEFAULT_BUDGET = TOOL_RESULT_BUDGET["default"]
+TOOL_RESULT_BUDGETS = TOOL_RESULT_BUDGET  # alias (same dict)
 TOOL_RESULTS_DIR = DATA_DIR / "tool_results"
 
 # ============================================================================
@@ -375,7 +462,7 @@ WEBSEARCH_MAX_RESULTS = 5
 # code_exec subprocess caps
 # ============================================================================
 PYTHON_EXECUTOR_MODE = "native"     # "native" = ephemeral subprocess; "opencode" = remote opencode server
-PYTHON_EXECUTOR_TIMEOUT = 300       # code_exec default; tool timeout=0 disables wall-clock kill
+PYTHON_EXECUTOR_TIMEOUT = CODE_EXEC_DEFAULT_TIMEOUT_SECONDS  # legacy alias; timeout<=0 means this default (capped by CODE_EXEC_HARD_CAP_SECONDS)
 PYTHON_EXECUTOR_MAX_OUTPUT_SIZE = 1024 * 1024 * 10
 OPENCODE_SERVER_HOST = "127.0.0.1"
 OPENCODE_SERVER_PORT = 37254
@@ -445,11 +532,18 @@ JOBS_CLEANUP_DAYS = 30
 # ============================================================================
 # Session Settings
 # ============================================================================
-MAX_CONVERSATION_HISTORY = 200
+MAX_CONVERSATION_HISTORY = 400
 # Hard cap on the recent conversation fed to the LLM, in estimated tokens.
 # Applied alongside MAX_CONVERSATION_HISTORY (whichever is more restrictive) so
 # the hot context never exceeds this budget regardless of message count.
-MAX_CONVERSATION_TOKENS = 80_000  # under the 100k compaction trigger, leaving ~20k for system prompt + tool growth
+# Bounded by cold-prefill latency rather than the 1M window: every non-cached
+# turn re-prefills this history. Well under the 750k compaction trigger,
+# leaving room for the system prompt and a long tool-heavy turn. If a smaller
+# MODEL_CONTEXT_WINDOW is configured, the cap shrinks to 30% of it so restored
+# history alone can never overflow the window (1M -> 300k).
+MAX_CONVERSATION_TOKENS = (
+    min(300_000, int(MODEL_CONTEXT_WINDOW * 0.3)) if MODEL_CONTEXT_WINDOW > 0 else 300_000
+)
 SESSIONS_DIR = DATA_DIR / "sessions"
 SESSION_CLEANUP_DAYS = 7
 
@@ -467,16 +561,8 @@ LLM_GENERATED_DIR = DATA_DIR / "llm_generated"   # dedicated dir for LLM absolut
 LLM_FILE_RETENTION_DAYS = 3                        # auto-delete files older than N days (0 = disabled)
 ALLOWED_WRITE_DIRS: list[Path] = []  # empty = allow all absolute paths
 
-# ============================================================================
-# Streaming Settings
-# ============================================================================
-# vLLM HTTP client timeouts. read=None → never time out waiting for the next
-# token, so long agentic turns and slow prefill on a near-full context window
-# are never cut off mid-stream. Connect stays finite so a dead vLLM backend
-# still fails fast (the backend also pre-checks /v1/models with a 3s timeout
-# before every stream, see VllmBackend._select_available_host).
-STREAM_CONNECT_TIMEOUT = 10.0
-STREAM_READ_TIMEOUT = None
+# (Streaming timeouts: see STREAM_* under "vLLM Performance Tuning" above —
+# defined once there.)
 
 # ============================================================================
 # CORS Settings

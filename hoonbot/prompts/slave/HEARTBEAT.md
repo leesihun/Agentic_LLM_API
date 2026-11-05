@@ -15,8 +15,8 @@ Walk this list and stop at the first real finding:
 3. **Cluster master reachability** — `CLUSTER_MASTER_API_URL` reachable,
    `/api/cluster/heartbeat` accepts this node's payload.
 4. **Local runtime risk** — disk space below threshold, llama.cpp slot
-   exhaustion, log file unbounded growth, GPU memory unavailable on a
-   GPU-tagged node.
+   exhaustion, log file unbounded growth, memory.md over its soft cap
+   (~8,000 chars), GPU memory unavailable on a GPU-tagged node.
 5. **Local task work** — leased task in flight that has stalled past the
    expected duration.
 
@@ -32,6 +32,15 @@ Walk this list and stop at the first real finding:
   log size).
 - Never include the actual credential value, cluster token, or any
   `.env` contents.
+
+# Memory and Status
+
+- Live readiness values (disk, GPU, master reachability, last heartbeat)
+  go to the `status_file` (data/status.md), overwritten each tick — never
+  into memory.md.
+- memory.md holds durable facts only and must stay under ~8,000 chars (hard
+  cap 12,000). Prune or merge stale entries with `file_edit` /
+  `apply_patch`; never paste logs or command output into it.
 
 # Sample Outputs
 

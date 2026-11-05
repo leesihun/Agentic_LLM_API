@@ -247,6 +247,113 @@ def _cleanup_old_cluster_tasks():
         print(f"[Startup] Cleaned up {removed} old cluster task(s)")
 
 
+def _cleanup_stale_turn_locks():
+    """Delete per-session *.turn.lock files left behind by idle/deleted sessions.
+
+    _cleanup_old_sessions never touches lock files, and on Linux filelock
+    leaves the file in place after release, so these accumulate one per
+    session forever. Only a lock (and its session's history files) untouched
+    for a day is considered, and only if a non-blocking acquire proves no
+    turn holds it right now.
+    """
+    sessions_dir = config.SESSIONS_DIR
+    if not sessions_dir.exists():
+        return
+    from filelock import FileLock, Timeout as FileLockTimeout
+
+    cutoff = time.time() - 24 * 60 * 60
+    removed = 0
+    for path in sessions_dir.glob("*.turn.lock"):
+        try:
+            session_id = path.name[:-len(".turn.lock")]
+            related = [path] + _session_artifact_paths(sessions_dir, session_id)[:-1]
+            if any(p.exists() and p.stat().st_mtime >= cutoff for p in related):
+                continue
+            lock = FileLock(str(path))
+            try:
+                lock.acquire(timeout=0)
+            except FileLockTimeout:
+                continue  # a turn holds it right now
+            try:
+                if sys.platform != "win32":
+                    # POSIX: unlink while still holding the flock.
+                    path.unlink(missing_ok=True)
+            finally:
+                lock.release(force=True)
+            # Windows: the file can't be removed while open (filelock usually
+            # deletes it on release already).
+            path.unlink(missing_ok=True)
+            removed += 1
+        except Exception:
+            pass
+    if removed:
+        print(f"[Startup] Cleaned up {removed} stale session turn lock(s)")
+
+
+def _cleanup_stale_cluster_files():
+    """Drop orphaned cluster index markers and old quarantined *.corrupt-* files.
+
+    Index markers (index/queued/{key}__{task_id}, index/leased/{task_id}) are
+    hints only; one whose task record no longer exists (retention cleanup,
+    quarantine) is dead weight. Markers whose task still exists are never
+    touched here — the store's own lock-holding paths own those. Quarantined
+    records (renamed *.corrupt-<ts>) are kept for CLUSTER_TASKS_CLEANUP_DAYS
+    for forensics, then removed.
+    """
+    if config.CLUSTER_TASKS_CLEANUP_DAYS <= 0:
+        return
+    cluster_dir = config.CLUSTER_DIR
+    if not cluster_dir.exists():
+        return
+    tasks_dir = cluster_dir / "tasks"
+    cutoff = time.time() - config.CLUSTER_TASKS_CLEANUP_DAYS * 24 * 60 * 60
+    markers = corrupt = 0
+
+    def _old(p: Path) -> bool:
+        return p.stat().st_mtime < cutoff
+
+    for sub in ("queued", "leased"):
+        index_dir = cluster_dir / "index" / sub
+        if not index_dir.is_dir():
+            continue
+        for marker in index_dir.iterdir():
+            try:
+                if not marker.is_file() or marker.name.startswith("."):
+                    continue
+                task_id = marker.name.partition("__")[2] if sub == "queued" else marker.name
+                if not task_id or (tasks_dir / f"{task_id}.json").exists():
+                    continue
+                if _old(marker):
+                    marker.unlink()
+                    markers += 1
+            except Exception:
+                pass
+
+    # Quarantined task records (tasks/) and nodes.json (cluster root).
+    for d in (cluster_dir, tasks_dir):
+        if not d.is_dir():
+            continue
+        for path in d.glob("*.corrupt-*"):
+            try:
+                # os.replace keeps the original mtime, so the quarantine
+                # stamp in the name (UTC) is the better age when present.
+                stamp = path.name.rpartition(".corrupt-")[2].split("-", 1)[0]
+                try:
+                    quarantined = datetime.strptime(stamp, "%Y%m%dT%H%M%S").replace(
+                        tzinfo=timezone.utc
+                    ).timestamp()
+                except ValueError:
+                    quarantined = 0.0
+                if path.is_file() and max(quarantined, path.stat().st_mtime) < cutoff:
+                    path.unlink()
+                    corrupt += 1
+            except Exception:
+                pass
+    if markers or corrupt:
+        print(f"[Startup] Cleaned up {markers} orphaned cluster index marker(s), "
+              f"{corrupt} old quarantined file(s)")
+
+
 def _rotate_log_if_stale(log_path: Path, label: str):
     """Rotate a .log file if its ctime is older than LOG_ROTATION_DAYS."""
     if not log_path.exists():
@@ -284,6 +391,8 @@ async def startup_event():
     _cleanup_old_scratch()
     _cleanup_old_llm_generated()
     _cleanup_old_cluster_tasks()
+    _cleanup_stale_cluster_files()
+    _cleanup_stale_turn_locks()
     _cleanup_old_logs()
 
     try:

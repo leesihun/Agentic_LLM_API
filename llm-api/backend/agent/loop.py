@@ -2,6 +2,8 @@
 import asyncio
 import hashlib
 import json as _json
+import re
+import uuid
 from collections import deque
 from pathlib import Path
 from typing import List, Dict, Any, Optional, AsyncIterator, Deque, Tuple
@@ -9,17 +11,130 @@ from typing import List, Dict, Any, Optional, AsyncIterator, Deque, Tuple
 import config
 from backend.core.llm_backend import (
     StreamEvent, TextEvent, ReasoningEvent,
-    ToolCallDeltaEvent, ToolCall, ToolStatusEvent, llm_backend,
+    ToolCallDeltaEvent, ToolCall, ToolCallFunction, ToolStatusEvent, llm_backend,
 )
-from backend.utils.stop_signal import check_stop
+from backend.utils.stop_signal import check_stop, StopInferenceError
 from tools.schemas import TOOL_METADATA
 
 from backend.agent._cache import _CACHED_GOAL_MODE_PROMPT
 from backend.agent.logging_helpers import LoggingMixin
 from backend.agent.prompt_assembly import PromptMixin
-from backend.agent.tool_dispatch import DispatchMixin
+from backend.agent.tool_dispatch import DispatchMixin, _format_exception
 from backend.agent.result_formatting import FormattingMixin
-from backend.agent.compaction import CompactionMixin
+from backend.agent.compaction import CompactionMixin, VllmStreamError
+
+
+# ---- Loop nudges / notices -------------------------------------------------
+# Nudges go into the in-run message list only (never persisted: chat.py stores
+# only the streamed TextEvents). Notices are user-visible TextEvents.
+_TRUNCATION_NUDGE = (
+    "Your previous output was cut off by the token limit. Continue exactly "
+    "where it stopped. Do not repeat anything."
+)
+_STREAM_ERROR_NUDGE = (
+    "Your previous output was interrupted by a connection error. Continue "
+    "exactly where it stopped. Do not repeat anything."
+)
+_TRUNCATED_TOOL_NUDGE = (
+    "Your tool call was truncated. Write large content with file_writer in "
+    "smaller chunks (append mode) or apply_patch."
+)
+_REISSUE_TOOL_NUDGE = (
+    "Your previous tool call did not arrive (it was empty or could not be "
+    "read). Re-issue the tool call with complete, valid JSON arguments."
+)
+_FINAL_ANSWER_NUDGE = (
+    "Write the final answer to the user now, in the user's language, based on "
+    "the work above."
+)
+_TOOLS_UNAVAILABLE_NUDGE = (
+    "<system-reminder>Tools are unavailable now; answer in text. Do not call "
+    "any tool — summarize what was done and what remains.</system-reminder>"
+)
+_LOOP_NUDGES = frozenset({
+    _TRUNCATION_NUDGE,
+    _STREAM_ERROR_NUDGE,
+    _TRUNCATED_TOOL_NUDGE,
+    _REISSUE_TOOL_NUDGE,
+    _FINAL_ANSWER_NUDGE,
+})
+_LENGTH_NOTICE = "\n\n[출력이 길이 제한으로 잘렸습니다]"
+_STREAM_ERROR_NOTICE = "\n\n[응답 생성 중 연결 오류로 출력이 중단되었습니다]"
+_TOOL_DROPPED_NOTICE = "\n\n[반복 한도에 도달하여 추가 도구 호출은 실행하지 않았습니다]"
+
+_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+_MAX_REASONING_TOOL_CALLS = 8
+_FINAL_NOTES_MAX_CHARS = 6000
+_MAX_REISSUE_NUDGES = 2
+# Continuations of a recovered final answer (Step A/B) that was itself cut by
+# its token cap or a mid-answer stream drop, before labelling it as cut.
+_FINAL_ANSWER_MAX_CONTINUATIONS = 2
+
+
+def _new_recovery_out() -> Dict[str, Any]:
+    """Result holder for one _stream_recovery_once call."""
+    return {"text": [], "reasoning": [], "tool_calls": [], "failed": False, "finish": None}
+
+
+def _recovery_cut(out: Dict[str, Any]) -> Optional[str]:
+    """"length" / "error" when a recovery stream that produced output was cut
+    (token cap, or an error after partial output); None when it completed."""
+    if out.get("failed") or out.get("finish") == "error":
+        return "error"
+    if out.get("finish") == "length":
+        return "length"
+    return None
+
+
+def _strip_unclosed_think(text: str) -> str:
+    """Drop a trailing `<think>` block that never closed (cut off mid-thought)."""
+    if not text or "<think>" not in text:
+        return text
+    last_open = text.rfind("<think>")
+    if text.find("</think>", last_open) == -1:
+        return text[:last_open]
+    return text
+
+
+def _text_after_think(reasoning: str) -> str:
+    """Answer text the model wrote after a `</think>` inside the reasoning
+    channel (template/parser mismatch). Tool-call markup is removed."""
+    if not reasoning or "</think>" not in reasoning:
+        return ""
+    tail = reasoning.rsplit("</think>", 1)[1]
+    tail = _TOOL_CALL_BLOCK_RE.sub("", tail)
+    if "<tool_call>" in tail:
+        tail = tail.split("<tool_call>", 1)[0]
+    return tail.strip()
+
+
+def _compose_assistant_content(text_body: str, reasoning_body: str) -> str:
+    """Assistant history content: reasoning kept inline as <think>…</think>."""
+    if reasoning_body:
+        if text_body:
+            return f"<think>\n{reasoning_body}\n</think>\n\n{text_body}"
+        return f"<think>\n{reasoning_body}\n</think>"
+    return text_body
+
+
+def _result_headline(result: Dict[str, Any], cap: int = 160) -> str:
+    """One-line summary of a tool result for the deterministic fallback."""
+    if not isinstance(result, dict):
+        return ""
+    if not result.get("success", True):
+        raw = result.get("error") or result.get("stderr") or ""
+    else:
+        raw = ""
+        for key in ("message", "summary", "result", "stdout", "output", "content", "status"):
+            val = result.get(key)
+            if isinstance(val, str) and val.strip():
+                raw = val
+                break
+    for line in str(raw).splitlines():
+        line = line.strip()
+        if line:
+            return line[:cap] + ("…" if len(line) > cap else "")
+    return ""
 
 
 class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, PromptMixin):
@@ -48,8 +163,18 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
         response_format: Optional[dict] = None,
         guided_json: Optional[dict] = None,
         mode: str = "normal",
+        chat_template_kwargs: Optional[dict] = None,
+        max_tokens: Optional[int] = None,
     ):
         self.model = model or config.VLLM_MODEL
+        # Per-request output ceiling (OpenAI `max_tokens`). None = DEFAULT_MAX_TOKENS.
+        # Only a ceiling: llm_backend still fits it to the context headroom.
+        try:
+            self.max_tokens: Optional[int] = int(max_tokens) if max_tokens is not None else None
+        except (TypeError, ValueError):
+            self.max_tokens = None
+        if self.max_tokens is not None and self.max_tokens <= 0:
+            self.max_tokens = None
         self.temperature = self._resolve_temperature(temperature)
         self.session_id = session_id
         self.username = username
@@ -67,7 +192,15 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
         # is gated as long as it needs; only repeated stalled quits trip the cap.
         self._completion_blocks = 0
         self._last_gate_completed = 0
-        self.enabled_tools = tools or config.AVAILABLE_TOOLS
+        # C5: an explicit empty list means "no tools at all" (disable_tools);
+        # only None falls back to the configured default set.
+        self.enabled_tools = list(tools) if tools is not None else list(config.AVAILABLE_TOOLS)
+        # Per-request chat-template override (C5), e.g. {"enable_thinking": False}
+        # or {"reasoning_effort": "high"}. Wins over AGENT_REASONING_EFFORT.
+        self.chat_template_kwargs: Optional[dict] = (
+            dict(chat_template_kwargs) if isinstance(chat_template_kwargs, dict) and chat_template_kwargs
+            else None
+        )
         # Structured/guided decoding (opt-in, forwarded to vLLM on each call).
         self.response_format = response_format
         self.guided_json = guided_json
@@ -81,12 +214,32 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
         # drive proactive compaction. 0 until the first call reports usage.
         self._last_prompt_tokens: int = 0
         # finish_reason of the last streamed LLM call (set by _stream_with_autocompact
-        # from the terminal UsageEvent). "length" means the turn was truncated at
-        # the token ceiling. Consumed in _run_stream_body to auto-continue.
-        self._last_finish_reason: str = "stop"
-        # Count of truncation auto-continues in the current run (bounded by
-        # AGENT_MAX_TRUNCATION_CONTINUATIONS). Reset per run in _run_stream_body.
+        # from the terminal UsageEvent, C3). None = unknown / no terminal event.
+        # "length" means the turn was truncated at the token ceiling.
+        self._last_finish_reason: Optional[str] = None
+        # CONSECUTIVE truncation auto-continues (bounded by
+        # AGENT_MAX_TRUNCATION_CONTINUATIONS); reset after any non-truncated
+        # iteration. The run total goes to diagnostics.
         self._truncation_continuations: int = 0
+        self._total_truncation_continuations: int = 0
+        # Run diagnostics (C7). Populated by run_stream's finally block.
+        self._empty_retries: int = 0
+        self._compactions: int = 0
+        self._fallback_used: bool = False
+        self._iterations_run: int = 0
+        self._tool_calls_dispatched: int = 0
+        self._reissue_nudges: int = 0
+        # Compact per-run ledger of executed tools, used by the deterministic
+        # final-answer fallback (never contains model reasoning).
+        self._worklog: List[Dict[str, Any]] = []
+        self._enabled_tool_names: set = set()
+        self._recovered_tool_calls: List[ToolCall] = []
+        self._final_answer_text: str = ""
+        # "length" / "error" when the last _ensure_final_answer recovery was
+        # itself cut off (after its own continuations); None when complete.
+        self._final_answer_cut: Optional[str] = None
+        self.final_finish_reason: Optional[str] = None
+        self.diagnostics: Dict[str, Any] = self._build_diagnostics(None)
         # Per-run memoization of read-only/concurrency-safe tool results, keyed by
         # (tool_name, arg_hash). Serves duplicate reads instantly; cleared by any
         # mutating tool. See DispatchMixin.execute_tool.
@@ -132,6 +285,16 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
         # _run_stream_body when any tool result has post_edit_check.status=="failed";
         # consumed (and cleared) by _apply_loop_overlays on the next iteration.
         self._pending_postcheck_reminder: Optional[str] = None
+
+        # Tool tasks launched with create_task (mid-stream early starts and
+        # concurrency-safe groups). Reaped — cancelled AND awaited — by
+        # run_stream's finally, so a closed/cancelled run (subagent deadline,
+        # client disconnect) never leaves tools or their processes running.
+        self._inflight_tasks: set = set()
+        # Subagent progress (child tool starts) queued by the agent dispatcher
+        # and forwarded to this stream while a tool group is awaited.
+        self._child_progress: Deque[ToolStatusEvent] = deque(maxlen=64)
+        self._child_progress_signal: Optional[asyncio.Event] = None
 
     # ------------------------------------------------------------------
     # Sampling parameters forwarded to vLLM
@@ -306,6 +469,19 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
         """The goal-mode instruction block, injected as its own system message."""
         return _CACHED_GOAL_MODE_PROMPT
 
+    def _goal_gate_would_block(self) -> bool:
+        """Side-effect-free prediction of `_goal_completion_block() is not None`
+        for the current todo state (todos only change via tool calls, so the
+        prediction holds for a no-tool-call iteration)."""
+        todos = self._session_todos or []
+        incomplete = [t for t in todos if t.get("status") != "completed"]
+        completed = len(todos) - len(incomplete)
+        blocks = 0 if completed > self._last_gate_completed else self._completion_blocks
+        cap = max(0, getattr(config, "AGENT_GOAL_MAX_COMPLETION_BLOCKS", 3))
+        if blocks >= cap:
+            return False
+        return not todos or bool(incomplete)
+
     def _goal_completion_block(self) -> Optional[str]:
         """Done-gate for goal mode. Called when the model tries to finish (no
         tool calls). Returns a `<system-reminder>` string to force the loop to
@@ -376,8 +552,24 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
                 text = " ".join(parts)
             else:
                 text = str(content) if content is not None else ""
+            if AgentLoop._is_loop_nudge(text):
+                # Loop-injected nudges are not the user's request.
+                continue
             return i, text
         return None
+
+    @staticmethod
+    def _is_loop_nudge(text: str) -> bool:
+        """True for user-role messages the loop itself injected."""
+        stripped = (text or "").strip()
+        if not stripped:
+            return False
+        if stripped in _LOOP_NUDGES:
+            return True
+        return (
+            stripped.endswith(_FINAL_ANSWER_NUDGE)
+            or stripped.startswith("<internal_notes>")
+        )
 
     @staticmethod
     def _has_prior_assistant_turn(msgs: List[Dict[str, Any]], user_idx: int) -> bool:
@@ -499,17 +691,22 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
             "min_p": config.DEFAULT_MIN_P,
             "repetition_penalty": config.DEFAULT_REPETITION_PENALTY,
         }
-        if final_response:
-            kwargs["max_tokens"] = config.DEFAULT_MAX_TOKENS
-        else:
-            kwargs["max_tokens"] = config.AGENT_TOOL_LOOP_MAX_TOKENS
+        # One output ceiling for tool-loop and final turns: the request's
+        # max_tokens when given, else DEFAULT_MAX_TOKENS. llm_backend fits it
+        # to the real context headroom on every call.
+        kwargs["max_tokens"] = (
+            getattr(self, "max_tokens", None)
+            or int(getattr(config, "DEFAULT_MAX_TOKENS", 100000))
+        )
         # Agent-loop reasoning depth. "high" is a big latency win over the global
         # "max" default across a multi-iteration tool loop; the per-call override
         # (see llm_backend._build_payload) wins over CHAT_TEMPLATE_KWARGS. None
-        # falls back to the global default.
+        # falls back to the global default. A per-request override (C5) wins.
         effort = getattr(config, "AGENT_REASONING_EFFORT", None)
         if effort:
             kwargs["chat_template_kwargs"] = {"reasoning_effort": effort}
+        if getattr(self, "chat_template_kwargs", None):
+            kwargs["chat_template_kwargs"] = dict(self.chat_template_kwargs)
         # Structured/guided decoding is opt-in per request. When the caller sets
         # it they want a constrained answer, so forward it on the agent's calls.
         if getattr(self, "response_format", None) is not None:
@@ -566,26 +763,482 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
                 print(f"[AGENT] Failed to remove temp file {path}: {exc}")
         self._tracked_new_files.clear()
 
+    # ------------------------------------------------------------------
+    # Run diagnostics (C7)
+    # ------------------------------------------------------------------
+
+    def _build_diagnostics(self, finish_reason: Optional[str]) -> Dict[str, Any]:
+        return {
+            "finish_reason": finish_reason,
+            "iterations": getattr(self, "_iterations_run", 0),
+            "truncation_continuations": getattr(self, "_total_truncation_continuations", 0),
+            "empty_retries": getattr(self, "_empty_retries", 0),
+            "tool_calls": getattr(self, "_tool_calls_dispatched", 0),
+            "compactions": getattr(self, "_compactions", 0),
+            "fallback_used": bool(getattr(self, "_fallback_used", False)),
+        }
+
+    def _reset_run_state(self) -> None:
+        self._last_finish_reason = None
+        self._truncation_continuations = 0
+        self._total_truncation_continuations = 0
+        self._empty_retries = 0
+        self._compactions = 0
+        self._fallback_used = False
+        self._iterations_run = 0
+        self._tool_calls_dispatched = 0
+        self._reissue_nudges = 0
+        self._worklog = []
+        self._recovered_tool_calls = []
+        self._final_answer_text = ""
+        self._final_answer_cut = None
+        self.final_finish_reason = None
+        self.diagnostics = self._build_diagnostics(None)
+
     async def run_stream(
         self,
         messages: List[Dict[str, Any]],
         attached_files: Optional[List[Dict[str, Any]]] = None,
     ) -> AsyncIterator[StreamEvent]:
         """Run the agent loop and yield events. Wraps _run_stream_body so we
-        can sweep non-persisted temp files in a single finally block, even on
-        early return / exception / generator close."""
+        can sweep non-persisted temp files and record diagnostics in a single
+        finally block, even on early return / exception / generator close.
+
+        After the run, `self.final_finish_reason` is one of "stop" | "length" |
+        "error" | "interrupted" and `self.diagnostics` holds the C7 dict."""
+        self._reset_run_state()
+        body = self._run_stream_body(messages, attached_files)
         try:
-            async for event in self._run_stream_body(messages, attached_files):
+            async for event in body:
                 yield event
+            if not self.final_finish_reason:
+                self.final_finish_reason = "stop"
+        except StopInferenceError:
+            self.final_finish_reason = "interrupted"
+            raise
+        except (asyncio.CancelledError, GeneratorExit):
+            self.final_finish_reason = "interrupted"
+            raise
+        except BaseException:
+            if self.final_finish_reason in (None, "stop", "length"):
+                self.final_finish_reason = "error"
+            raise
         finally:
-            self._cleanup_temp_files()
+            try:
+                # Close the body explicitly (not via GC) so its own cleanup runs,
+                # then cancel AND await every tool task it launched — before the
+                # temp-file sweep, so no tool is still writing/running.
+                try:
+                    await body.aclose()
+                except Exception:
+                    pass
+                await self._reap_inflight_tasks()
+            finally:
+                if not self.final_finish_reason:
+                    self.final_finish_reason = "interrupted"
+                self.diagnostics = self._build_diagnostics(self.final_finish_reason)
+                try:
+                    self._log(f"[AGENT] Run diagnostics: {_json.dumps(self.diagnostics)}")
+                except Exception:
+                    pass
+                self._cleanup_temp_files()
+
+    # ------------------------------------------------------------------
+    # Loop helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cancel_tasks(tasks) -> None:
+        for t in tasks:
+            if t is not None and not t.done():
+                t.cancel()
+
+    def _launch_tool(self, tc: ToolCall) -> asyncio.Task:
+        """create_task(_safe_execute) tracked in _inflight_tasks until done."""
+        task = asyncio.create_task(self._safe_execute(tc))
+        self._inflight_tasks.add(task)
+        task.add_done_callback(self._inflight_tasks.discard)
+        return task
+
+    async def _reap_inflight_tasks(self, timeout: float = 15.0) -> None:
+        """Cancel every still-running tool task and wait (bounded) for its
+        cancellation cleanup — e.g. process-tree kills — to finish."""
+        tasks = [t for t in self._inflight_tasks if not t.done()]
+        if not tasks:
+            return
+        for t in tasks:
+            t.cancel()
+        try:
+            _, still = await asyncio.wait(tasks, timeout=timeout)
+        except Exception:
+            return
+        if still:
+            self._log(f"[AGENT] {len(still)} tool task(s) still running {timeout:.0f}s "
+                      f"after cancellation; abandoning them")
+
+    def _emit_child_progress(self, event: ToolStatusEvent) -> None:
+        """Queue a subagent progress event for the stream (never raises)."""
+        try:
+            self._child_progress.append(event)
+            if self._child_progress_signal is not None:
+                self._child_progress_signal.set()
+        except Exception:
+            pass
+
+    async def _await_with_progress(self, tasks: List[asyncio.Task]) -> AsyncIterator[StreamEvent]:
+        """Wait for *tasks* to finish, yielding queued subagent progress
+        events meanwhile (results are read from the tasks afterwards)."""
+        if self._child_progress_signal is None:
+            self._child_progress_signal = asyncio.Event()
+        signal = self._child_progress_signal
+        pending = {t for t in tasks if not t.done()}
+        while pending:
+            waiter = asyncio.ensure_future(signal.wait())
+            try:
+                await asyncio.wait(pending | {waiter}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                if not waiter.done():
+                    waiter.cancel()
+            pending = {t for t in pending if not t.done()}
+            signal.clear()
+            while self._child_progress:
+                yield self._child_progress.popleft()
+        self._child_progress.clear()
+
+    @staticmethod
+    def _task_outcome(task: asyncio.Task) -> Any:
+        """A finished task's result in asyncio.gather(return_exceptions=True) form."""
+        if task.cancelled():
+            return asyncio.CancelledError()
+        exc = task.exception()
+        return exc if exc is not None else task.result()
+
+    async def _safe_execute(self, tc: ToolCall) -> Dict[str, Any]:
+        """execute_tool that never raises (except cancellation)."""
+        try:
+            return await self.execute_tool(
+                tc.function.name, tc.function.arguments, tc.id,
+                parse_error=getattr(tc.function, "parse_error", None),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            return {"success": False, "error": _format_exception(e)}
+
+    @staticmethod
+    def _coerce_tool_result(r: Any) -> Dict[str, Any]:
+        if isinstance(r, BaseException):
+            if isinstance(r, asyncio.CancelledError):
+                return {"success": False, "error": "Tool call was cancelled"}
+            return {"success": False, "error": _format_exception(r)}
+        if r is None:
+            return {"success": False, "error": "Tool produced no result"}
+        if not isinstance(r, dict):
+            return {"success": r is not None, "output": r}
+        return r
+
+    @staticmethod
+    def _is_partial_stream_failure(exc: BaseException, saw_output: bool) -> bool:
+        """True when a stream died AFTER producing output (keep the partial)."""
+        import httpx
+        if isinstance(exc, VllmStreamError):
+            return bool(getattr(exc, "partial", False)) or saw_output
+        if isinstance(exc, (httpx.TransportError, httpx.HTTPStatusError,
+                            asyncio.TimeoutError, TimeoutError)):
+            return saw_output
+        return False
+
+    def _tool_calls_from_reasoning(self, reasoning: str) -> List[ToolCall]:
+        """Parse `<tool_call>` blocks the model wrote inside its reasoning
+        channel (backend helper) into dispatchable ToolCalls."""
+        names = self._enabled_tool_names
+        if not reasoning or "<tool_call>" not in reasoning or not names:
+            return []
+        try:
+            from backend.core.llm_backend import _parse_leaked_tool_call
+        except ImportError:
+            return []
+        calls: List[ToolCall] = []
+        seen = set()
+        for m in _TOOL_CALL_BLOCK_RE.finditer(reasoning):
+            try:
+                parsed = _parse_leaked_tool_call(m.group(1))
+            except Exception:
+                parsed = None
+            if not parsed or not isinstance(parsed, (tuple, list)) or len(parsed) < 2:
+                continue
+            name, args = parsed[0], parsed[1]
+            if name not in names:
+                continue
+            if not isinstance(args, dict):
+                args = {}
+            sig = self._tool_signature(name, args)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            calls.append(ToolCall(
+                id=f"call_{uuid.uuid4().hex[:8]}",
+                function=ToolCallFunction(name=name, arguments=args),
+            ))
+            if len(calls) >= _MAX_REASONING_TOOL_CALLS:
+                break
+        return calls
+
+    def _record_worklog(self, tc: ToolCall, result: Dict[str, Any]) -> None:
+        name = tc.function.name
+        args = tc.function.arguments if isinstance(tc.function.arguments, dict) else {}
+        success = bool(result.get("success", True))
+        paths: List[str] = []
+        if success and name in ("file_writer", "file_edit", "apply_patch"):
+            for key in ("path", "file_path"):
+                v = args.get(key) or result.get(key)
+                if isinstance(v, str) and v:
+                    paths.append(v)
+                    break
+            files = result.get("files") or result.get("files_changed")
+            if isinstance(files, list):
+                paths.extend(str(f) for f in files[:10] if isinstance(f, (str, Path)))
+        self._worklog.append({
+            "name": name,
+            "success": success,
+            "headline": _result_headline(result),
+            "paths": paths,
+        })
+
+    def _deterministic_fallback_answer(self) -> str:
+        """Korean summary of the work done, built from the tool ledger only.
+        Never a bare "완료." and never model reasoning."""
+        log = self._worklog
+        if not log:
+            return (
+                "죄송합니다. 이번 요청에 대한 답변을 생성하지 못했습니다 "
+                "(모델이 빈 응답을 반환했습니다). 같은 요청을 다시 보내 주시거나 "
+                "질문을 조금 더 구체적으로 적어 주세요."
+            )
+        counts: Dict[str, int] = {}
+        failures = 0
+        temp_files = {str(p) for p in (getattr(self, "_tracked_new_files", None) or set())}
+        files: List[str] = []
+        for e in log:
+            counts[e["name"]] = counts.get(e["name"], 0) + 1
+            if not e["success"]:
+                failures += 1
+            for p in e.get("paths") or []:
+                if p not in files and p not in temp_files:
+                    files.append(p)
+        tools_str = ", ".join(
+            f"{name} {n}회" for name, n in sorted(counts.items(), key=lambda kv: -kv[1])
+        )
+        total = f"총 {len(log)}회" + (f", 실패 {failures}회" if failures else "")
+        lines = [
+            "모델이 최종 답변을 작성하지 못해, 지금까지 수행한 작업을 자동으로 정리했습니다.",
+            "",
+            f"- 실행한 도구: {tools_str} ({total})",
+        ]
+        if files:
+            more = f" 외 {len(files) - 10}개" if len(files) > 10 else ""
+            lines.append(f"- 작성/수정한 파일: {', '.join(files[:10])}{more}")
+        last = log[-1]
+        status = "성공" if last["success"] else "실패"
+        headline = f": {last['headline']}" if last.get("headline") else ""
+        lines.append(f"- 마지막 도구 결과: {last['name']} ({status}){headline}")
+        lines.append("")
+        lines.append("결과를 확인하신 뒤 필요한 부분을 다시 요청해 주세요.")
+        return "\n".join(lines)
+
+    async def _stream_recovery_once(
+        self,
+        msgs: List[Dict[str, Any]],
+        iteration: int,
+        agent_type: str,
+        kwargs: Dict[str, Any],
+        out: Dict[str, Any],
+    ) -> AsyncIterator[StreamEvent]:
+        """One tool-less recovery LLM call. Yields TextEvents / autocompact
+        ToolStatusEvents and fills *out* (text, reasoning, tool_calls, failed,
+        finish). A non-stop error is swallowed (out["failed"]) — after partial
+        output that marks the answer as cut, before it the caller moves on."""
+        try:
+            async for ev in self._stream_with_autocompact(
+                msgs, self.model, self.temperature,
+                iteration=iteration,
+                session_id=self.session_id,
+                agent_type=agent_type,
+                **kwargs,
+            ):
+                if isinstance(ev, TextEvent):
+                    out["text"].append(ev.content)
+                    yield ev
+                elif isinstance(ev, ReasoningEvent):
+                    out["reasoning"].append(ev.content)
+                elif isinstance(ev, ToolStatusEvent):
+                    yield ev
+                elif isinstance(ev, ToolCallDeltaEvent):
+                    out["tool_calls"].extend(ev.tool_calls)
+        except (StopInferenceError, asyncio.CancelledError):
+            raise
+        except Exception as e:
+            out["failed"] = True
+            self._log(f"[EMPTY_ANSWER] {agent_type} failed: {_format_exception(e)[:300]}")
+        out["finish"] = self._last_finish_reason
+
+    async def _ensure_final_answer(
+        self,
+        msgs: List[Dict[str, Any]],
+        reasoning_body: str,
+        iteration: int,
+        allow_tools: bool,
+    ) -> AsyncIterator[StreamEvent]:
+        """Recover a final answer after an iteration ended with no visible text
+        and no tool calls (the "완료." / empty-answer bug).
+
+        Order: text after `</think>` inside reasoning → Step A (thinking off,
+        short budget, no tools) → Step B (reasoning_effort=high) → Step C
+        deterministic Korean summary of the tool ledger. Yields TextEvents (and
+        autocompact ToolStatusEvents). Sets self._final_answer_text, or — when
+        a retry produced tool calls and tools are allowed —
+        self._recovered_tool_calls for the caller to dispatch. A Step A/B
+        answer cut by its token cap or a mid-answer stream drop is continued
+        up to _FINAL_ANSWER_MAX_CONTINUATIONS times; if still cut, a notice is
+        yielded and self._final_answer_cut is set ("length" / "error") for the
+        caller's finish_reason.
+        """
+        self._recovered_tool_calls = []
+        self._final_answer_text = ""
+        self._final_answer_cut = None
+        self._empty_retries += 1
+        self._log(
+            f"[EMPTY_ANSWER] iteration={iteration + 1} reasoning_chars={len(reasoning_body or '')} "
+            f"finish={self._last_finish_reason} — recovering final answer"
+        )
+
+        promoted = _text_after_think(reasoning_body)
+        if promoted:
+            self._log(f"[EMPTY_ANSWER] promoted {len(promoted)} chars written after </think> in reasoning")
+            yield TextEvent(content=promoted)
+            msgs.append({"role": "assistant", "content": promoted})
+            self._final_answer_text = promoted
+            return
+
+        notes = _TOOL_CALL_BLOCK_RE.sub("", reasoning_body or "").strip()
+        if len(notes) > _FINAL_NOTES_MAX_CHARS:
+            notes = "…" + notes[-_FINAL_NOTES_MAX_CHARS:]
+        if notes:
+            nudge = (
+                "<internal_notes>\n(Your own reasoning from the previous step. Use it; "
+                "do not quote it verbatim.)\n"
+                f"{notes}\n</internal_notes>\n\n{_FINAL_ANSWER_NUDGE}"
+            )
+        else:
+            nudge = _FINAL_ANSWER_NUDGE
+        msgs.append({"role": "user", "content": nudge})
+
+        short_max = max(256, int(getattr(config, "AGENT_FINAL_ANSWER_RETRY_MAX_TOKENS", 4096)))
+        min_out = int(getattr(config, "MIN_OUTPUT_TOKENS", 8192))
+        steps = (
+            ("A", {"enable_thinking": False}, short_max),
+            # Thinking stays on in B, so give it room to finish reasoning AND answer.
+            ("B", {"reasoning_effort": "high"}, max(short_max * 4, min_out)),
+        )
+        tool_dropped = False
+        for label, ctk, max_tok in steps:
+            check_stop(self.session_id)
+            kwargs = self._sampling_kwargs(final_response=True)
+            kwargs["chat_template_kwargs"] = ctk
+            kwargs["max_tokens"] = min(max_tok, self.max_tokens) if self.max_tokens else max_tok
+            out = _new_recovery_out()
+            async for ev in self._stream_recovery_once(
+                msgs, iteration, f"agent:stream:final-answer-{label}", kwargs, out,
+            ):
+                yield ev
+            text = "".join(out["text"])
+            reason_parts: List[str] = out["reasoning"]
+            tool_calls: List[ToolCall] = out["tool_calls"]
+            if not text.strip():
+                promoted = _text_after_think("".join(reason_parts))
+                if promoted:
+                    yield TextEvent(content=promoted)
+                    text = promoted
+            if text.strip():
+                # A recovery answer that hit its own token cap (finish=length)
+                # or whose stream died mid-answer is NOT complete: continue it
+                # a bounded number of times, then label it as cut.
+                cut = _recovery_cut(out)
+                chunk = text
+                conts = 0
+                while cut and conts < _FINAL_ANSWER_MAX_CONTINUATIONS:
+                    check_stop(self.session_id)
+                    conts += 1
+                    self._total_truncation_continuations += 1
+                    nudge_c = _TRUNCATION_NUDGE if cut == "length" else _STREAM_ERROR_NUDGE
+                    msgs.append({"role": "assistant", "content": chunk.strip()})
+                    msgs.append({"role": "user", "content": nudge_c})
+                    self._log(f"[EMPTY_ANSWER] step {label} answer cut (finish={cut}) — "
+                              f"continuing ({conts}/{_FINAL_ANSWER_MAX_CONTINUATIONS})")
+                    out = _new_recovery_out()
+                    async for ev in self._stream_recovery_once(
+                        msgs, iteration, f"agent:stream:final-answer-{label}-cont", kwargs, out,
+                    ):
+                        yield ev
+                    chunk = "".join(out["text"])
+                    if not chunk.strip():
+                        chunk = _text_after_think("".join(out["reasoning"]))
+                        if chunk:
+                            yield TextEvent(content=chunk)
+                    if not chunk.strip():
+                        # Continuation produced nothing: drop its nudge so the
+                        # transcript ends on the recorded partial answer.
+                        if msgs and msgs[-1].get("content") == nudge_c:
+                            msgs.pop()
+                        chunk = ""
+                        break
+                    text += chunk
+                    cut = _recovery_cut(out)
+                if chunk.strip():
+                    msgs.append({"role": "assistant", "content": chunk.strip()})
+                if cut:
+                    self._log(f"[EMPTY_ANSWER] step {label} answer still cut "
+                              f"(finish={cut}) — labelling the reply as {cut}")
+                    yield TextEvent(content=_LENGTH_NOTICE if cut == "length" else _STREAM_ERROR_NOTICE)
+                    self._final_answer_cut = cut
+                self._log(f"[EMPTY_ANSWER] recovered via step {label} ({len(text)} chars)")
+                self._final_answer_text = text
+                return
+
+            if not tool_calls and allow_tools:
+                tool_calls = self._tool_calls_from_reasoning("".join(reason_parts))
+            if tool_calls:
+                good = [tc for tc in tool_calls if not getattr(tc.function, "parse_error", None)]
+                if allow_tools and good:
+                    self._log(f"[EMPTY_ANSWER] step {label} produced {len(good)} "
+                              f"tool call(s) instead of text — dispatching them")
+                    self._recovered_tool_calls = good
+                    return
+                if not allow_tools:
+                    tool_dropped = True
+            self._log(f"[EMPTY_ANSWER] step {label} produced no text")
+
+        fallback = self._deterministic_fallback_answer()
+        if tool_dropped:
+            fallback += _TOOL_DROPPED_NOTICE
+        self._fallback_used = True
+        self._log("[EMPTY_ANSWER] steps A/B failed — using deterministic fallback summary")
+        yield TextEvent(content=fallback)
+        msgs.append({"role": "assistant", "content": fallback})
+        self._final_answer_text = fallback
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
 
     async def _run_stream_body(
         self,
         messages: List[Dict[str, Any]],
         attached_files: Optional[List[Dict[str, Any]]] = None,
     ) -> AsyncIterator[StreamEvent]:
-        self._refresh_available_rag_collections()
+        # RAG listing, git and the workspace walk are blocking IO — keep them
+        # off the event loop so concurrent sessions aren't stalled.
+        await asyncio.to_thread(self._refresh_available_rag_collections)
         system_prompt = self._build_system_prompt()
         msgs: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
         # Goal-mode preamble as its own system message after the (byte-stable,
@@ -595,16 +1248,28 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
             preamble = self._goal_mode_preamble()
             if preamble:
                 msgs.append({"role": "system", "content": preamble})
-        dynamic_ctx = self._build_dynamic_context(attached_files)
+        dynamic_ctx = await asyncio.to_thread(self._build_dynamic_context, attached_files)
         if dynamic_ctx:
             msgs.append({"role": "system", "content": dynamic_ctx})
+        # Everything after this index is caller-supplied (compaction's last
+        # resort may shrink an oversize caller system message, never ours).
+        self._own_system_count = len(msgs)
         msgs.extend(messages)
         self._enforce_history_limit(msgs)
         tool_schemas = self._get_tool_schemas()
+        self._enabled_tool_names = {
+            s["function"]["name"] for s in (tool_schemas or [])
+            if isinstance(s, dict) and isinstance(s.get("function"), dict)
+        }
         self._truncation_continuations = 0
+        max_cont = max(0, int(getattr(config, "AGENT_MAX_TRUNCATION_CONTINUATIONS", 6)))
+        # Visible text streamed since the last tool round (spans truncation
+        # continuations), used to decide whether an answer exists.
+        answer_parts: List[str] = []
 
         for iteration in range(self.max_iterations):
             check_stop(self.session_id)
+            self._iterations_run = iteration + 1
             print(f"\n[AGENT-STREAM] Iteration {iteration + 1}/{self.max_iterations}")
             self._log_iteration_start(iteration, streaming=True)
 
@@ -614,118 +1279,273 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
             # and subagent fan-out) run in parallel during resolution; mutating
             # tools are serial barriers. Read-only safe tools additionally start
             # mid-stream as soon as their args parse (see resolution below).
-            all_tool_calls: list[ToolCall] = []
+            all_tool_calls: List[ToolCall] = []
             # (tc, task_or_none) pairs; None means deferred serial execution.
-            pending_tasks: list[tuple[ToolCall, Optional[asyncio.Task]]] = []
+            pending_tasks: List[Tuple[ToolCall, Optional[asyncio.Task]]] = []
             deferred_seen = False
             # Accumulate any text the model streams alongside tool calls so the
             # assistant turn we record back into msgs preserves it. Without this,
             # the model sees content=None next iteration and may emit empty replies.
-            streamed_text_parts: list[str] = []
+            streamed_text_parts: List[str] = []
             # Reasoning/thinking deltas (separate field on reasoning models).
             # Preserved in history but NOT yielded to the caller, so the user
             # never sees raw chain-of-thought.
-            streamed_reasoning_parts: list[str] = []
-            log_start = len(self.tool_calls_log)
+            streamed_reasoning_parts: List[str] = []
+            stream_error: Optional[BaseException] = None
+            # Goal mode with the done-gate armed: a no-tool-call answer this
+            # iteration would be blocked, so hold its text back until we know
+            # (released as soon as a tool call arrives or the gate passes;
+            # dropped if the gate blocks — otherwise the client would receive
+            # every blocked "final answer" concatenated).
+            hold_text = self.goal_mode and self._goal_gate_would_block()
+            held_text: List[TextEvent] = []
 
             # Compressed view is rebuilt per attempt inside the wrapper. msgs
             # is the source-of-truth list; auto-compact mutates it on overflow.
-            async for event in self._stream_with_autocompact(
-                msgs, self.model, self.temperature,
-                iteration=iteration,
-                tools=tool_schemas,
-                session_id=self.session_id,
-                agent_type="agent:stream",
-                **self._sampling_kwargs(final_response=True),
-            ):
-                if isinstance(event, TextEvent):
-                    streamed_text_parts.append(event.content)
-                    yield event
-                elif isinstance(event, ReasoningEvent):
-                    streamed_reasoning_parts.append(event.content)
-                    # Internal-only: NOT yielded to the caller (chat.py / hoonbot).
-                elif isinstance(event, ToolCallDeltaEvent):
-                    for tc in event.tool_calls:
-                        all_tool_calls.append(tc)
-                        task = None
-                        if self._can_start_tool_immediately(tc.function.name, deferred_seen):
-                            task = asyncio.create_task(
-                                self.execute_tool(tc.function.name, tc.function.arguments, tc.id)
-                            )
+            try:
+                async for event in self._stream_with_autocompact(
+                    msgs, self.model, self.temperature,
+                    iteration=iteration,
+                    tools=tool_schemas,
+                    session_id=self.session_id,
+                    agent_type="agent:stream",
+                    **self._sampling_kwargs(final_response=True),
+                ):
+                    if isinstance(event, TextEvent):
+                        streamed_text_parts.append(event.content)
+                        if hold_text and not all_tool_calls:
+                            held_text.append(event)
                         else:
-                            deferred_seen = True
-                        pending_tasks.append((tc, task))
-                        _meta = TOOL_METADATA.get(tc.function.name, {})
-                        if task is not None:
-                            yield ToolStatusEvent(
-                                tool_name=tc.function.name,
-                                tool_call_id=tc.id,
-                                status="started",
-                                activity=_meta.get("activity", ""),
-                                user_name=_meta.get("user_name", ""),
-                            )
+                            yield event
+                    elif isinstance(event, ReasoningEvent):
+                        streamed_reasoning_parts.append(event.content)
+                        # Internal-only: NOT yielded to the caller (chat.py / hoonbot).
+                    elif isinstance(event, ToolStatusEvent):
+                        # Autocompact progress — forward so clients see activity.
+                        yield event
+                    elif isinstance(event, ToolCallDeltaEvent):
+                        if held_text and event.tool_calls:
+                            # It's tool narration after all — release it in order.
+                            for h in held_text:
+                                yield h
+                            held_text.clear()
+                        for tc in event.tool_calls:
+                            all_tool_calls.append(tc)
+                            task = None
+                            has_parse_error = bool(getattr(tc.function, "parse_error", None))
+                            if not has_parse_error and self._can_start_tool_immediately(
+                                tc.function.name, deferred_seen
+                            ):
+                                task = self._launch_tool(tc)
+                            elif not has_parse_error:
+                                deferred_seen = True
+                            pending_tasks.append((tc, task))
+                            _meta = TOOL_METADATA.get(tc.function.name, {})
+                            if task is not None:
+                                yield ToolStatusEvent(
+                                    tool_name=tc.function.name,
+                                    tool_call_id=tc.id,
+                                    status="started",
+                                    activity=_meta.get("activity", ""),
+                                    user_name=_meta.get("user_name", ""),
+                                )
+            except BaseException as e:
+                saw_output = bool(streamed_text_parts or streamed_reasoning_parts or all_tool_calls)
+                if (
+                    isinstance(e, Exception)
+                    and not isinstance(e, StopInferenceError)
+                    and self._is_partial_stream_failure(e, saw_output)
+                ):
+                    stream_error = e
+                    self._log(f"[AGENT] LLM stream failed after partial output "
+                              f"({_format_exception(e)[:300]}) — keeping the partial")
+                else:
+                    self._cancel_tasks([t for _, t in pending_tasks])
+                    if isinstance(e, Exception):
+                        if not isinstance(e, StopInferenceError):
+                            self.final_finish_reason = "error"
+                        # Never swallow text the user would have seen unheld.
+                        for h in held_text:
+                            yield h
+                        held_text.clear()
+                    raise
+
+            finish = self._last_finish_reason
+            saw_output = bool(streamed_text_parts or streamed_reasoning_parts or all_tool_calls)
+            if stream_error is not None or (finish == "error" and saw_output):
+                finish = "error_partial"
+            truncated = finish in ("length", "error_partial")
+            if not truncated:
+                self._truncation_continuations = 0
+
+            text_body = "".join(streamed_text_parts)
+            reasoning_body = "".join(streamed_reasoning_parts).strip()
+
+            # Under truncation, a tool call whose arguments failed to parse was
+            # cut off mid-JSON: drop it (never execute half a file write) and
+            # tell the model how to avoid it. Fully parsed calls are kept.
+            truncated_tool_dropped = False
+            if truncated and all_tool_calls:
+                kept = [(tc, t) for tc, t in pending_tasks
+                        if not getattr(tc.function, "parse_error", None)]
+                if len(kept) != len(pending_tasks):
+                    truncated_tool_dropped = True
+                    self._log(f"[AGENT] Dropped {len(pending_tasks) - len(kept)} truncated "
+                              f"tool call(s) (finish_reason={finish})")
+                    pending_tasks = kept
+                    all_tool_calls = [tc for tc, _ in kept]
 
             if not all_tool_calls:
-                # Output truncated at the token ceiling (finish_reason=length):
-                # the model was cut off mid-answer or mid-<think>, not actually
-                # done — and a partial tool call, if any, was already suppressed
-                # by the backstop. Don't silently end: preserve what it produced
-                # and continue so it can finish, bounded so the run terminates.
-                max_cont = getattr(config, "AGENT_MAX_TRUNCATION_CONTINUATIONS", 3)
-                if self._last_finish_reason == "length" and self._truncation_continuations < max_cont:
-                    self._truncation_continuations += 1
-                    text_body = "".join(streamed_text_parts).strip()
-                    reasoning_body = "".join(streamed_reasoning_parts).strip()
-                    if reasoning_body:
-                        partial = (
-                            f"<think>\n{reasoning_body}\n</think>\n\n{text_body}"
-                            if text_body else f"<think>\n{reasoning_body}\n</think>"
-                        )
-                    else:
-                        partial = text_body
-                    if partial:
-                        msgs.append({"role": "assistant", "content": partial})
-                    self._log(
-                        f"[AGENT] Output truncated (finish_reason=length) — continuing "
-                        f"({self._truncation_continuations}/{max_cont})"
-                    )
-                    continue
+                answer_parts.append(text_body)
+                visible_so_far = "".join(answer_parts)
+                fallback_before = self._fallback_used
 
-                # Empty stream after tool results: model produced no text and no
-                # tool calls. Some chat templates emit an end-of-turn token right
-                # after a tool result, leaving the user with nothing. Retry once
-                # with tools disabled to force a final text answer.
-                if not streamed_text_parts and iteration > 0:
-                    self._log("[AGENT] Empty LLM response after tool result — retrying without tools")
-                    async for event in self._stream_with_autocompact(
-                        msgs, self.model, self.temperature,
-                        iteration=iteration,
-                        session_id=self.session_id,
-                        agent_type="agent:stream:empty-retry",
-                        **self._sampling_kwargs(final_response=True),
-                    ):
-                        if isinstance(event, TextEvent):
-                            yield event
-                # Goal-mode done-gate: refuse to finish while todos are still
-                # open. Record the model's attempted final answer so the loop
-                # stays coherent, inject the reminder, and continue instead of
-                # returning. Capped so it always eventually terminates.
-                if self.goal_mode:
-                    block = self._goal_completion_block()
-                    if block is not None:
-                        final_text = "".join(streamed_text_parts).strip()
-                        if final_text:
-                            msgs.append({"role": "assistant", "content": final_text})
-                        msgs.append({"role": "system", "content": block})
-                        self._completion_blocks += 1
+                # ---- Truncation / partial-stream continuation ----
+                if truncated:
+                    # Mid-answer cut: the gate decision waits for the end of
+                    # the answer, so release the held part now.
+                    for h in held_text:
+                        yield h
+                    held_text.clear()
+                    if self._truncation_continuations < max_cont:
+                        self._truncation_continuations += 1
+                        self._total_truncation_continuations += 1
+                        partial = _compose_assistant_content(
+                            _strip_unclosed_think(text_body).strip(), reasoning_body,
+                        )
+                        if partial:
+                            msgs.append({"role": "assistant", "content": partial})
+                        if truncated_tool_dropped:
+                            nudge = _TRUNCATED_TOOL_NUDGE
+                        elif finish == "error_partial":
+                            nudge = _STREAM_ERROR_NUDGE
+                        else:
+                            nudge = _TRUNCATION_NUDGE
+                        msgs.append({"role": "user", "content": nudge})
                         self._log(
-                            f"[AGENT] Goal-mode done-gate: blocking completion "
-                            f"({self._completion_blocks}/"
-                            f"{getattr(config, 'AGENT_GOAL_MAX_COMPLETION_BLOCKS', 3)})"
+                            f"[AGENT] Output truncated (finish_reason={finish}) — continuing "
+                            f"({self._truncation_continuations}/{max_cont})"
                         )
                         continue
-                self._log_agent_complete("LLM returned final text response (stream)", iteration + 1)
-                return
+                    # Cap reached: stop with a visible notice rather than loop forever.
+                    self._log(f"[AGENT] Truncation continuation cap ({max_cont}) reached")
+                    if not visible_so_far.strip():
+                        # Only reasoning was cut; the recovery writes a fresh
+                        # answer, so label the run by THAT answer (complete →
+                        # "stop"; the recovery adds its own notice if cut).
+                        async for ev in self._ensure_final_answer(
+                            msgs, reasoning_body, iteration, allow_tools=False,
+                        ):
+                            yield ev
+                        self.final_finish_reason = self._final_answer_cut or "stop"
+                    else:
+                        # The visible answer really is cut: one inline notice
+                        # (persisted with the turn) + the matching finish_reason.
+                        yield TextEvent(
+                            content=_LENGTH_NOTICE if finish == "length" else _STREAM_ERROR_NOTICE
+                        )
+                        self.final_finish_reason = "length" if finish == "length" else "error"
+                    self._log_agent_complete(
+                        f"Truncation cap reached (finish_reason={finish})", iteration + 1,
+                    )
+                    return
+
+                # ---- finish_reason says "tool call" but none arrived ----
+                if (
+                    finish in ("tool_calls", "tool")
+                    and self._enabled_tool_names
+                    and self._reissue_nudges < _MAX_REISSUE_NUDGES
+                ):
+                    self._reissue_nudges += 1
+                    partial = _compose_assistant_content(text_body.strip(), reasoning_body)
+                    if partial:
+                        msgs.append({"role": "assistant", "content": partial})
+                    msgs.append({"role": "user", "content": _REISSUE_TOOL_NUDGE})
+                    self._log(f"[AGENT] finish_reason={finish} but no tool calls — asking "
+                              f"the model to re-issue ({self._reissue_nudges}/{_MAX_REISSUE_NUDGES})")
+                    # This text was pre-tool narration ("X를 확인해 보겠습니다"),
+                    # not an answer: don't let it satisfy the empty-answer check
+                    # if the re-issued turn comes back empty.
+                    if answer_parts:
+                        answer_parts.pop()
+                    for h in held_text:
+                        yield h
+                    held_text.clear()
+                    continue
+
+                # ---- Empty answer: no visible text, no tool calls ----
+                answer_recorded = False
+                if not visible_so_far.strip():
+                    recovered = self._tool_calls_from_reasoning(reasoning_body)
+                    if recovered:
+                        self._log(f"[EMPTY_ANSWER] dispatching {len(recovered)} tool call(s) "
+                                  f"found inside reasoning")
+                        reasoning_body = _TOOL_CALL_BLOCK_RE.sub("", reasoning_body).strip()
+                        all_tool_calls = recovered
+                        pending_tasks = [(tc, None) for tc in recovered]
+                    else:
+                        async for ev in self._ensure_final_answer(
+                            msgs, reasoning_body, iteration,
+                            allow_tools=bool(self._enabled_tool_names),
+                        ):
+                            if hold_text and isinstance(ev, TextEvent):
+                                held_text.append(ev)
+                            else:
+                                yield ev
+                        if self._recovered_tool_calls:
+                            all_tool_calls = list(self._recovered_tool_calls)
+                            pending_tasks = [(tc, None) for tc in all_tool_calls]
+                            # The nudge is already in msgs; the recovered call's
+                            # assistant turn carries no text of its own.
+                            text_body, reasoning_body = "", ""
+                        else:
+                            answer_recorded = True
+
+                if not all_tool_calls:
+                    # Goal-mode done-gate (only once a non-empty answer exists):
+                    # refuse to finish while todos are still open. Record the
+                    # answer so the loop stays coherent, inject the reminder and
+                    # continue. Capped so it always eventually terminates.
+                    if self.goal_mode:
+                        block = self._goal_completion_block()
+                        if block is not None:
+                            final_text = text_body.strip()
+                            if final_text and not answer_recorded:
+                                msgs.append({"role": "assistant", "content": final_text})
+                            msgs.append({"role": "system", "content": block})
+                            self._completion_blocks += 1
+                            answer_parts.clear()
+                            if held_text:
+                                # The blocked answer never reached the client.
+                                self._log(f"[AGENT] Goal-mode done-gate: withheld "
+                                          f"{sum(len(h.content) for h in held_text)} chars "
+                                          f"of the blocked answer")
+                                held_text.clear()
+                                # A withheld fallback was never delivered.
+                                self._fallback_used = fallback_before
+                            self._log(
+                                f"[AGENT] Goal-mode done-gate: blocking completion "
+                                f"({self._completion_blocks}/"
+                                f"{getattr(config, 'AGENT_GOAL_MAX_COMPLETION_BLOCKS', 3)})"
+                            )
+                            continue
+                    for h in held_text:
+                        yield h
+                    held_text.clear()
+                    # A recovered answer that was itself cut keeps its label;
+                    # anything else that reaches here completed normally.
+                    self.final_finish_reason = (
+                        (self._final_answer_cut if answer_recorded else None)
+                        or self.final_finish_reason or "stop"
+                    )
+                    self._log_agent_complete("LLM returned final text response (stream)", iteration + 1)
+                    return
+
+            # ---------------- Tool execution ----------------
+            for h in held_text:
+                yield h
+            held_text.clear()
+            answer_parts.clear()
 
             # Log what the LLM requested
             self._log_tool_calls_requested(all_tool_calls, iteration)
@@ -735,15 +1555,9 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
             # `<think>...</think>` so the model can build on its own chain of
             # thought on the next iteration. MiniMax M2 in particular degrades
             # severely when prior reasoning is stripped from history.
-            text_body = "".join(streamed_text_parts).strip()
-            reasoning_body = "".join(streamed_reasoning_parts).strip()
-            if reasoning_body:
-                if text_body:
-                    combined_content = f"<think>\n{reasoning_body}\n</think>\n\n{text_body}"
-                else:
-                    combined_content = f"<think>\n{reasoning_body}\n</think>"
-            else:
-                combined_content = text_body
+            combined_content = _compose_assistant_content(
+                _strip_unclosed_think(text_body).strip(), reasoning_body,
+            )
             msgs.append(self._build_assistant_tool_msg(
                 all_tool_calls,
                 content=combined_content or None,
@@ -756,6 +1570,7 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
                 self._tool_call_history.append(
                     self._tool_signature(tc.function.name, tc.function.arguments)
                 )
+            self._tool_calls_dispatched += len(all_tool_calls)
 
             # Resolve results. Like Claude Code / Cursor / Codex, independent
             # work runs concurrently while mutations stay ordered: a maximal run
@@ -768,53 +1583,68 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
             # read-after-write and write-after-write ordering within the turn.
             # Tools already launched mid-stream (task is not None) are awaited in
             # place; the rest are launched here. Results stay in model order.
-            results: List[Optional[Dict[str, Any]]] = [None] * len(pending_tasks)
-            idx = 0
+            # gather(return_exceptions=True): one tool blowing up becomes an error
+            # result for that call only. On cancellation / stop / generator close
+            # every launched task is cancelled before re-raising.
             n_pending = len(pending_tasks)
-            while idx < n_pending:
-                meta = TOOL_METADATA.get(pending_tasks[idx][0].function.name, {})
-                if meta.get("is_concurrency_safe"):
-                    group_idx: list[int] = []
-                    coros: list = []
-                    while idx < n_pending:
-                        g_tc, g_task = pending_tasks[idx]
-                        g_meta = TOOL_METADATA.get(g_tc.function.name, {})
-                        if not g_meta.get("is_concurrency_safe"):
-                            break
-                        if g_task is None:
-                            # Not started mid-stream — launch now and announce it.
-                            yield ToolStatusEvent(
-                                tool_name=g_tc.function.name,
-                                tool_call_id=g_tc.id,
-                                status="started",
-                                activity=g_meta.get("activity", ""),
-                                user_name=g_meta.get("user_name", ""),
-                            )
-                            coros.append(
-                                self.execute_tool(g_tc.function.name, g_tc.function.arguments, g_tc.id)
-                            )
+            results: List[Optional[Dict[str, Any]]] = [None] * n_pending
+            launched: List[asyncio.Task] = [t for _, t in pending_tasks if t is not None]
+            try:
+                idx = 0
+                while idx < n_pending:
+                    meta = TOOL_METADATA.get(pending_tasks[idx][0].function.name, {})
+                    if meta.get("is_concurrency_safe"):
+                        group_idx: List[int] = []
+                        group_tasks: List[asyncio.Task] = []
+                        while idx < n_pending:
+                            g_tc, g_task = pending_tasks[idx]
+                            g_meta = TOOL_METADATA.get(g_tc.function.name, {})
+                            if not g_meta.get("is_concurrency_safe"):
+                                break
+                            if g_task is None:
+                                # Not started mid-stream — launch now and announce it.
+                                g_task = self._launch_tool(g_tc)
+                                launched.append(g_task)
+                                yield ToolStatusEvent(
+                                    tool_name=g_tc.function.name,
+                                    tool_call_id=g_tc.id,
+                                    status="started",
+                                    activity=g_meta.get("activity", ""),
+                                    user_name=g_meta.get("user_name", ""),
+                                )
+                            group_tasks.append(g_task)
+                            group_idx.append(idx)
+                            idx += 1
+                        if any(pending_tasks[i][0].function.name == "agent" for i in group_idx):
+                            # Subagents run for minutes: forward their progress
+                            # (child tool starts) while waiting.
+                            progress = self._await_with_progress(group_tasks)
+                            try:
+                                async for ev in progress:
+                                    yield ev
+                            finally:
+                                await progress.aclose()
+                            group_results = [self._task_outcome(t) for t in group_tasks]
                         else:
-                            # Already running from the mid-stream early start.
-                            coros.append(g_task)
-                        group_idx.append(idx)
+                            group_results = await asyncio.gather(*group_tasks, return_exceptions=True)
+                        for r_idx, r in zip(group_idx, group_results):
+                            results[r_idx] = self._coerce_tool_result(r)
+                    else:
+                        # Serial barrier: mutating / stateful tool runs alone.
+                        tc, _ = pending_tasks[idx]
+                        yield ToolStatusEvent(
+                            tool_name=tc.function.name,
+                            tool_call_id=tc.id,
+                            status="started",
+                            activity=meta.get("activity", ""),
+                            user_name=meta.get("user_name", ""),
+                        )
+                        results[idx] = self._coerce_tool_result(await self._safe_execute(tc))
                         idx += 1
-                    group_results = await asyncio.gather(*coros)
-                    for r_idx, r in zip(group_idx, group_results):
-                        results[r_idx] = r
-                else:
-                    # Serial barrier: mutating / stateful tool runs alone.
-                    tc, _ = pending_tasks[idx]
-                    yield ToolStatusEvent(
-                        tool_name=tc.function.name,
-                        tool_call_id=tc.id,
-                        status="started",
-                        activity=meta.get("activity", ""),
-                        user_name=meta.get("user_name", ""),
-                    )
-                    results[idx] = await self.execute_tool(
-                        tc.function.name, tc.function.arguments, tc.id
-                    )
-                    idx += 1
+            except BaseException:
+                self._cancel_tasks(launched)
+                raise
+            results = [self._coerce_tool_result(r) for r in results]
 
             # Record iteration outcome (all-failed vs at-least-one-success)
             # for the consecutive-failure detector.
@@ -825,10 +1655,10 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
             self._pending_postcheck_reminder = None
             for r in results:
                 pec = r.get("post_edit_check")
-                if pec and pec.get("status") == "failed":
+                if isinstance(pec, dict) and pec.get("status") == "failed":
                     lines = "; ".join(
-                        f"{f['path']}: {f['error']}"
-                        for f in pec.get("failures", [])
+                        f"{f.get('path', '?')}: {f.get('error', '?')}"
+                        for f in pec.get("failures", []) if isinstance(f, dict)
                     )
                     self._pending_postcheck_reminder = (
                         f"<system-reminder>Post-edit check FAILED: {lines} — "
@@ -837,28 +1667,38 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
                     )
                     break
 
-            new_entries = self.tool_calls_log[log_start:]
+            # Durations by call id (tool_calls_log is capped, so look ids up
+            # rather than slicing by a pre-iteration offset).
+            call_ids = {tc.id for tc in all_tool_calls}
             duration_by_call_id = {
                 e.get("tool_call_id"): e.get("duration", 0)
-                for e in new_entries
+                for e in self.tool_calls_log
+                if e.get("tool_call_id") in call_ids
             }
             durations = [duration_by_call_id.get(tc.id, 0) for tc in all_tool_calls]
             self._log_execution_summary(all_tool_calls, results, durations, iteration)
 
             # Emit "completed"/"failed" events and append results
             for tc, result in zip(all_tool_calls, results):
-                duration = duration_by_call_id.get(tc.id, 0)
+                duration = duration_by_call_id.get(tc.id, 0) or 0
                 status = "completed" if result.get("success", True) else "failed"
                 _meta = TOOL_METADATA.get(tc.function.name, {})
                 yield ToolStatusEvent(
                     tool_name=tc.function.name,
                     tool_call_id=tc.id,
                     status=status,
-                    duration=round(duration, 2),
+                    duration=round(float(duration), 2),
                     activity=_meta.get("activity", ""),
                     user_name=_meta.get("user_name", ""),
                 )
                 msgs.append(self._build_tool_result_msg(tc, result))
+                try:
+                    self._record_worklog(tc, result)
+                except Exception:
+                    pass
+
+            if truncated_tool_dropped:
+                msgs.append({"role": "user", "content": _TRUNCATED_TOOL_NUDGE})
 
             # If any tool requested clarification, relay the question to the user
             # and pause the loop. The user's next message resumes with full context.
@@ -879,19 +1719,64 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
                     relay = "\n".join(lines)
                 self._log(f"  [CLARIFICATION] Pausing — relaying question to user: {relay[:300]}")
                 self._log_agent_complete("Tool requested clarification from user", iteration + 1)
+                self.final_finish_reason = "stop"
                 yield TextEvent(content=relay)
                 return
 
         # Max iterations — final answer without tools
         print(f"[AGENT-STREAM] Max iterations ({self.max_iterations}) reached, requesting final answer")
         self._log_agent_complete(f"Max iterations ({self.max_iterations}) reached (stream)", self.max_iterations)
-        async for event in self._stream_with_autocompact(
-            msgs, self.model, self.temperature,
-            iteration=self.max_iterations,
-            use_compressed_view=False,
-            session_id=self.session_id,
-            agent_type="agent:stream:final",
-            **self._sampling_kwargs(final_response=True),
-        ):
-            if isinstance(event, TextEvent):
-                yield event
+        check_stop(self.session_id)
+        msgs.append({"role": "system", "content": _TOOLS_UNAVAILABLE_NUDGE})
+        final_text_parts: List[str] = []
+        final_reason_parts: List[str] = []
+        tool_dropped = False
+        stream_error = None
+        try:
+            async for event in self._stream_with_autocompact(
+                msgs, self.model, self.temperature,
+                iteration=self.max_iterations,
+                use_compressed_view=False,
+                session_id=self.session_id,
+                agent_type="agent:stream:final",
+                **self._sampling_kwargs(final_response=True),
+            ):
+                if isinstance(event, TextEvent):
+                    final_text_parts.append(event.content)
+                    yield event
+                elif isinstance(event, ReasoningEvent):
+                    final_reason_parts.append(event.content)
+                elif isinstance(event, ToolStatusEvent):
+                    yield event
+                elif isinstance(event, ToolCallDeltaEvent):
+                    tool_dropped = True
+        except Exception as e:
+            saw_output = bool(final_text_parts or final_reason_parts)
+            if not isinstance(e, StopInferenceError) and self._is_partial_stream_failure(e, saw_output):
+                stream_error = e
+                self._log(f"[AGENT] Final-answer stream failed after partial output "
+                          f"({_format_exception(e)[:300]})")
+            else:
+                self.final_finish_reason = "error" if not isinstance(e, StopInferenceError) else None
+                raise
+
+        final_text = "".join(final_text_parts)
+        if not final_text.strip():
+            async for ev in self._ensure_final_answer(
+                msgs, "".join(final_reason_parts).strip(), self.max_iterations, allow_tools=False,
+            ):
+                yield ev
+            if tool_dropped and not self._fallback_used:
+                yield TextEvent(content=_TOOL_DROPPED_NOTICE)
+            if self._final_answer_cut:
+                self.final_finish_reason = self._final_answer_cut
+        else:
+            if tool_dropped:
+                yield TextEvent(content=_TOOL_DROPPED_NOTICE)
+            if stream_error is not None:
+                yield TextEvent(content=_STREAM_ERROR_NOTICE)
+                self.final_finish_reason = "error"
+            elif self._last_finish_reason == "length":
+                yield TextEvent(content=_LENGTH_NOTICE)
+                self.final_finish_reason = "length"
+        self.final_finish_reason = self.final_finish_reason or "stop"

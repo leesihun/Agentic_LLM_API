@@ -4,7 +4,41 @@ Tool schemas for the LLM agent (OpenAI function-calling format).
 Consumed by backend/agent.py at module load time to build the tool list
 sent to vLLM. Parameter names must exactly match what _dispatch_tool()
 passes to each tool's execute/read/write/navigate/edit/search method.
+
+Descriptions are built once at import from config (deterministic f-strings),
+so the serialized tool list stays byte-stable for vLLM prefix caching.
 """
+
+try:
+    import config as _config
+except Exception:  # pragma: no cover - schemas must import even without config
+    _config = None
+
+
+def _cfg_int(name: str, default: int) -> int:
+    try:
+        return int(getattr(_config, name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+_AIRGAPPED = bool(getattr(_config, "AIRGAPPED", True))
+_SUBAGENT_MAX_PER_TURN = _cfg_int("SUBAGENT_MAX_PER_TURN", 16)
+_SHELL_DEFAULT_TIMEOUT = _cfg_int("SHELL_DEFAULT_TIMEOUT_SECONDS", 300)
+_SHELL_MAX_TIMEOUT = _cfg_int("SHELL_EXEC_HARD_CAP_SECONDS", 3600)
+_CODE_DEFAULT_TIMEOUT = _cfg_int("CODE_EXEC_DEFAULT_TIMEOUT_SECONDS", 300)
+_CODE_MAX_TIMEOUT = _cfg_int("CODE_EXEC_HARD_CAP_SECONDS", 1800)
+
+_OFFLINE_NOTE = (
+    " This deployment is airgapped: there is no internet access (no pip/npm "
+    "install from an index, no curl/wget to external hosts)."
+    if _AIRGAPPED else ""
+)
+_EXPLORE_TOOL_LIST = (
+    "file_reader, grep, file_navigator, rag, shell_lint"
+    if _AIRGAPPED else
+    "file_reader, grep, file_navigator, rag, shell_lint, websearch"
+)
 
 TOOL_SCHEMAS: dict = {
 
@@ -17,10 +51,11 @@ TOOL_SCHEMAS: dict = {
         "description": (
             "Execute a shell command. State does not persist between calls — pass "
             "working_directory when cwd matters. Check the ## ENVIRONMENT block for "
-            "the active shell (PowerShell on Windows uses `;` and `$env:VAR`; bash "
-            "uses `&&` and `$VAR`). For long-running servers/watchers use "
-            "process_monitor instead. For reading/searching files use file_reader, "
-            "grep, and file_navigator — not cat/grep/find."
+            "the active shell (on Linux servers it is bash: `&&`, `$VAR`; PowerShell "
+            "on Windows uses `;` and `$env:VAR`). For long-running servers/watchers "
+            "or jobs that may outlive the timeout use process_monitor instead. For "
+            "reading/searching files use file_reader, grep, and file_navigator — not "
+            f"cat/grep/find.{_OFFLINE_NOTE}"
         ),
         "parameters": {
             "type": "object",
@@ -31,11 +66,19 @@ TOOL_SCHEMAS: dict = {
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Maximum seconds to wait (default: 300). Process is killed on timeout.",
+                    "description": (
+                        f"Maximum seconds to wait (default: {_SHELL_DEFAULT_TIMEOUT}; omit or 0 = "
+                        f"the default, NOT unlimited; values above {_SHELL_MAX_TIMEOUT} are capped). "
+                        "The process tree is killed on timeout."
+                    ),
                 },
                 "working_directory": {
                     "type": "string",
-                    "description": "Working directory for the command. Relative paths resolve from the repository root. Defaults to repository root.",
+                    "description": (
+                        "Working directory for the command. Relative paths resolve against the "
+                        "session workspace (the default agent workspace when none is set). "
+                        "Defaults to the session workspace."
+                    ),
                 },
                 "description": {
                     "type": "string",
@@ -249,7 +292,8 @@ TOOL_SCHEMAS: dict = {
             "ripgrep content search. Supports full regex, glob filters, and file-type "
             "filters. Output modes: 'files_with_matches' (default, just paths), "
             "'content' (matching lines, supports -A/-B/-C), 'count'. For multi-round "
-            "open-ended exploration, use the `agent` tool with subagent_type='explore'."
+            "open-ended exploration of several areas, fan out parallel `agent` calls "
+            "with subagent_type='explore'."
         ),
         "parameters": {
             "type": "object",
@@ -333,7 +377,11 @@ TOOL_SCHEMAS: dict = {
             "Run a complete Python script. Returns stdout/stderr/returncode. "
             "Use for data processing, calculations, library calls, plotting, ML. "
             "Prefer this over shell_exec for Python work. Check returncode before "
-            "declaring success. Set timeout=0 only when the user wants no wall-clock limit."
+            "declaring success. The script runs with cwd = the session workspace "
+            "(also exported as WORKSPACE_DIR), so relative paths read/write project "
+            "files; the script file itself lives in a temp dir. Write outputs you "
+            "want to keep to explicit paths. For jobs longer than "
+            f"{_CODE_MAX_TIMEOUT}s use process_monitor.{_OFFLINE_NOTE}"
         ),
         "parameters": {
             "type": "object",
@@ -344,7 +392,10 @@ TOOL_SCHEMAS: dict = {
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Maximum seconds for execution (default: 300). Set 0 for no wall-clock timeout.",
+                    "description": (
+                        f"Maximum seconds for execution (default: {_CODE_DEFAULT_TIMEOUT}; omit or 0 = "
+                        f"the default, NOT unlimited; values above {_CODE_MAX_TIMEOUT} are capped)."
+                    ),
                 },
             },
             "required": ["code"],
@@ -406,12 +457,25 @@ TOOL_SCHEMAS: dict = {
     "agent": {
         "name": "agent",
         "description": (
-            "Spawn a subagent in fresh context. subagent_type='explore' is read-only "
-            "(file_reader, grep, file_navigator, websearch) for broad codebase research; "
-            "'general' has the full toolset for delegated subtasks. Use only when the "
-            "question needs multiple rounds — skip for narrow lookups a single grep or "
-            "file_reader could answer. Relay the subagent's findings yourself; the "
-            "result is not shown to the user automatically."
+            "Spawn a subagent with a fresh context that works a subtask to completion "
+            "and returns its final report. PARALLEL FAN-OUT: put several `agent` calls "
+            "in ONE assistant message and they run concurrently (up to "
+            f"{_SUBAGENT_MAX_PER_TURN} per turn; extra calls are queued, never "
+            "dropped). Whenever a task splits into independent parts — different "
+            "files, modules, questions, datasets or hypotheses — launch one subagent "
+            "per part in the same message instead of doing the parts one by one.\n\n"
+            f"subagent_type='explore' (default): read-only tools ({_EXPLORE_TOOL_LIST}); "
+            "explore calls may start while your message is still streaming. "
+            "'general': full toolset (no nested agent) for delegated work that edits "
+            "files or runs code; general calls start after your message is complete. "
+            "Parallel general subagents share the workspace — give each one disjoint "
+            "files.\n\n"
+            "Each subagent sees ONLY its prompt (not this conversation), so make every "
+            "prompt self-contained: goal, relevant paths/context, constraints, and the "
+            "exact output you want back. Skip subagents for a lookup a single grep or "
+            "file_reader answers. The result holds the subagent's final report plus a "
+            "transcript_path for the full log; the user does not see it — relay what "
+            "matters yourself."
         ),
         "parameters": {
             "type": "object",
@@ -419,15 +483,18 @@ TOOL_SCHEMAS: dict = {
                 "prompt": {
                     "type": "string",
                     "description": (
-                        "Task or question for the subagent. Be specific — brief the agent like a "
-                        "smart colleague who just walked in. Include: what to find, what files/areas "
-                        "to look in, what form the answer should take."
+                        "Self-contained task for the subagent — brief it like a smart colleague who "
+                        "just walked in. Include: the goal, which files/areas to look in or change, "
+                        "constraints, and what form the final report should take."
                     ),
                 },
                 "subagent_type": {
                     "type": "string",
                     "enum": ["explore", "general"],
-                    "description": "'explore' for read-only codebase research (default). 'general' for full toolset tasks.",
+                    "description": (
+                        "'explore' for read-only research (default, may start early). "
+                        "'general' for full-toolset work that edits files or runs commands."
+                    ),
                 },
                 "description": {
                     "type": "string",
@@ -477,8 +544,9 @@ TOOL_SCHEMAS: dict = {
             "Retrieve relevant information from user-uploaded document collections using semantic "
             "search. Use for searching uploaded PDFs, docs, or datasets.\n\n"
             "You must specify which collection to search. Use only existing collection_name values "
-            "listed in context. Results are document chunks ranked by relevance.\n\n"
-            "Use rag for uploaded documents; use websearch for live web results."
+            "listed in context. Results are document chunks ranked by relevance."
+            + ("" if _AIRGAPPED else
+               "\n\nUse rag for uploaded documents; use websearch for live web results.")
         ),
         "parameters": {
             "type": "object",
@@ -580,7 +648,11 @@ TOOL_SCHEMAS: dict = {
                     "type": "integer",
                     "description": (
                         "Line offset for 'read_output'. Use next_offset from a previous read to get new lines. "
-                        "If omitted, returns the last 200 lines."
+                        "If omitted, returns the last 200 lines. "
+                        "In stream=both, passing either stream's next_offset continues each stream "
+                        "from its own last read (stdout and stderr count lines separately); any other "
+                        "value is used as an explicit line position for both streams (past a stream's end, "
+                        "that stream resumes from its own last read, or its tail if never read)."
                     ),
                 },
                 "max_lines": {
@@ -623,7 +695,15 @@ TOOL_SCHEMAS: dict = {
 
 }
 
+# Airgapped deployments have no internet: don't advertise websearch at all
+# (config.AVAILABLE_TOOLS drops it too; the tool itself also fails fast).
+if _AIRGAPPED:
+    TOOL_SCHEMAS.pop("websearch", None)
+
 # Per-tool metadata: safety flags, UI activity descriptions, user-facing names.
+# Metadata stays for every tool (incl. websearch) so lookups never KeyError.
+# `agent` is concurrency-safe (parallel fan-out) but not read-only; the loop
+# early-starts only subagent_type='explore' calls.
 # Mirrors openclaude's Tool.ts metadata fields.
 TOOL_METADATA: dict = {
     "shell_exec":      {"is_read_only": False, "is_destructive": True,  "is_concurrency_safe": False, "activity": "Running shell command",   "user_name": "Shell"},

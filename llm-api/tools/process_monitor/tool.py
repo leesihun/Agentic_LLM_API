@@ -1,7 +1,13 @@
 """
 Process Monitor Tool
 Launch background processes, check status, read output incrementally, kill them.
-Processes are scoped per session and tracked in an in-memory registry.
+Processes are scoped per session and tracked in an in-memory registry
+(per server process — run llm-api with SERVER_WORKERS = 1).
+
+Processes are spawned through the same shell as shell_exec (bash on POSIX,
+PowerShell on Windows) in their own process group/session with
+stdin=DEVNULL and the non-interactive env from backend.utils.proc_lifecycle;
+`kill` terminates the whole process tree, not just the shell wrapper.
 """
 import subprocess
 import threading
@@ -12,6 +18,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List
 
 import config
+from backend.utils import proc_lifecycle
 
 MAX_BUFFER_LINES = getattr(config, "PROCESS_MONITOR_MAX_BUFFER_LINES", 5000)
 MAX_PER_SESSION = getattr(config, "PROCESS_MONITOR_MAX_PER_SESSION", 20)
@@ -36,7 +43,47 @@ class ManagedProcess:
     stderr_buf: deque = field(default_factory=lambda: deque(maxlen=MAX_BUFFER_LINES))
     total_stdout_lines: int = 0
     total_stderr_lines: int = 0
+    exited_at: Optional[float] = None   # first time poll() saw the exit
+    # Per-stream read cursor: next_offset last returned for each stream, so
+    # read_output(stream="both", offset=<one stream's next_offset>) continues
+    # each stream from its own position instead of applying one offset to both.
+    read_cursor: Dict[str, Optional[int]] = field(
+        default_factory=lambda: {"stdout": None, "stderr": None})
+    _group_gone: bool = field(default=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def group_alive(self) -> bool:
+        """POSIX: True while any member of the process group (the wrapper's
+        backgrounded children, e.g. `server &`) is still running.
+
+        Latched: once the group is seen empty its pgid may be reused by an
+        unrelated process, so it is never probed (or signalled) again."""
+        if self._group_gone:
+            return False
+        if self.proc.poll() is None:
+            return True
+        if proc_lifecycle.group_alive(self.pid):
+            return True
+        self._group_gone = True
+        return False
+
+    def poll(self) -> Optional[int]:
+        """proc.poll() that also records when the exit was first observed.
+
+        The process group stays registered for the atexit tree-kill while any
+        member is alive — the shell wrapper exiting does not mean its
+        backgrounded children did."""
+        code = self.proc.poll()
+        if code is not None:
+            if self.exited_at is None:
+                self.exited_at = time.time()
+            if not self.group_alive():
+                proc_lifecycle.untrack(self.proc)
+        return code
+
+    def active(self) -> bool:
+        """Wrapper still running, or its process group still has live members."""
+        return self.poll() is None or self.group_alive()
 
 
 def _start_drain_threads(managed: ManagedProcess):
@@ -44,15 +91,24 @@ def _start_drain_threads(managed: ManagedProcess):
 
     def drain(pipe, buf_attr: str, counter_attr: str):
         buf: deque = getattr(managed, buf_attr)
+        skipping = False  # inside the remainder of an over-long line
         while True:
             try:
-                line = pipe.readline()
-            except ValueError:
+                # Bounded read: a child that never writes a newline (binary
+                # dump, endless progress output) must not grow server memory.
+                line = pipe.readline(MAX_LINE_LENGTH + 1)
+            except (ValueError, OSError):
                 break
             if not line:
                 break
+            complete = line.endswith("\n")
+            if skipping:
+                if complete:
+                    skipping = False
+                continue
             if len(line) > MAX_LINE_LENGTH:
                 line = line[:MAX_LINE_LENGTH] + "...[truncated]\n"
+                skipping = not complete
             with managed._lock:
                 buf.append(line)
                 setattr(managed, counter_attr, getattr(managed, counter_attr) + 1)
@@ -119,14 +175,18 @@ class ProcessRegistry:
             return list(self._processes.get(session_id, {}).values())
 
     def cleanup_dead(self, session_id: str):
-        """Remove entries for processes that exited more than DEAD_CLEANUP_SECONDS ago."""
+        """Remove entries for processes that exited more than DEAD_CLEANUP_SECONDS ago.
+
+        A handle whose wrapper exited but whose process group still has live
+        members (backgrounded `server &`) is kept, so the model can still see
+        and kill it; it stays registered for the atexit tree-kill as well."""
         now = time.time()
         with self._lock:
             session = self._processes.get(session_id, {})
             to_remove = []
             for handle, managed in session.items():
-                if managed.proc.poll() is not None:
-                    exited_duration = now - managed.started_at
+                if not managed.active():
+                    exited_duration = now - (managed.exited_at or now)
                     if exited_duration > DEAD_CLEANUP_SECONDS:
                         to_remove.append(handle)
             for handle in to_remove:
@@ -144,29 +204,56 @@ _registry = ProcessRegistry()
 class ProcessMonitorTool:
     """Manage background processes for a session."""
 
-    def __init__(self, session_id: str):
-        self.session_id = session_id
-        self.workspace = config.SCRATCH_DIR / session_id
-        self.workspace.mkdir(parents=True, exist_ok=True)
+    def __init__(self, session_id: str, workspace_dir: Optional[str] = None):
+        self.session_id = session_id or "default"
+        self.workspace_dir: Optional[Path] = None
+        if workspace_dir:
+            try:
+                self.workspace_dir = Path(workspace_dir).expanduser().resolve()
+            except Exception:
+                self.workspace_dir = Path(workspace_dir)
+        # Default cwd + resolution base for relative working_directory —
+        # same rule as shell_exec: session workspace, else AGENT_DEFAULT_WORKSPACE.
+        default_base = getattr(config, "AGENT_DEFAULT_WORKSPACE", None) or Path.cwd()
+        self.workspace = self.workspace_dir or Path(default_base)
+
+    @staticmethod
+    def _as_int(value: Any, default: Optional[int]) -> Optional[int]:
+        if value is None or value == "" or isinstance(value, bool):
+            return default
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
 
     def execute(self, operation: str, **kwargs) -> Dict[str, Any]:
+        operation = (operation or "").strip().lower() if isinstance(operation, str) else operation
+        handle = kwargs.get("handle") or ""
         if operation == "start":
             return self._start(kwargs.get("command"), kwargs.get("working_directory"))
         elif operation == "status":
-            return self._status(kwargs.get("handle", ""))
+            return self._status(handle)
         elif operation == "read_output":
-            return self._read_output(
-                kwargs.get("handle", ""),
-                offset=kwargs.get("offset"),
-                max_lines=kwargs.get("max_lines", DEFAULT_READ_LINES),
-                stream=kwargs.get("stream", "both"),
-            )
+            max_lines = self._as_int(kwargs.get("max_lines"), DEFAULT_READ_LINES)
+            if max_lines is None or max_lines <= 0:
+                max_lines = DEFAULT_READ_LINES
+            offset = self._as_int(kwargs.get("offset"), None)
+            if offset is not None and offset < 0:
+                offset = None
+            stream = str(kwargs.get("stream") or "both").strip().lower()
+            if stream not in ("stdout", "stderr", "both"):
+                stream = "both"
+            return self._read_output(handle, offset=offset, max_lines=max_lines, stream=stream)
         elif operation == "kill":
-            return self._kill(kwargs.get("handle", ""))
+            return self._kill(handle)
         elif operation == "list":
             return self._list()
         else:
-            return {"success": False, "error": f"Unknown operation: {operation}"}
+            return {
+                "success": False,
+                "error": f"Unknown operation: {operation}",
+                "hint": "Use one of: start, status, read_output, kill, list.",
+            }
 
     # ------------------------------------------------------------------
     # Operations
@@ -179,9 +266,12 @@ class ProcessMonitorTool:
         # Lazy cleanup of dead processes
         _registry.cleanup_dead(self.session_id)
 
+        if not isinstance(command, str):
+            command = str(command)
+
         # Enforce per-session limit
         existing = _registry.list_for_session(self.session_id)
-        alive = [p for p in existing if p.proc.poll() is None]
+        alive = [p for p in existing if p.active()]
         if len(alive) >= MAX_PER_SESSION:
             return {
                 "success": False,
@@ -190,21 +280,37 @@ class ProcessMonitorTool:
             }
 
         cwd = self._resolve_working_directory(working_directory)
-        cwd.mkdir(parents=True, exist_ok=True)
+        if not cwd.exists():
+            if working_directory:
+                return {
+                    "success": False,
+                    "error": f"Working directory does not exist: {cwd}",
+                    "hint": "Relative working_directory paths resolve from the session workspace "
+                            f"({self.workspace}); omit it to run there.",
+                }
+            try:
+                cwd.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                return {"success": False, "error": f"Cannot create working directory {cwd}: {e}"}
+        if not cwd.is_dir():
+            return {"success": False, "error": f"Working directory is not a directory: {cwd}"}
 
         try:
             proc = subprocess.Popen(
-                command,
-                shell=True,
+                proc_lifecycle.shell_argv(command),
                 cwd=str(cwd),
+                env=proc_lifecycle.child_env(str(self.workspace_dir) if self.workspace_dir else None),
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                **proc_lifecycle.spawn_kwargs(),
             )
         except Exception as e:
-            return {"success": False, "error": f"Failed to start process: {e}"}
+            return {"success": False, "error": f"Failed to start process: {type(e).__name__}: {e}"}
+        proc_lifecycle.track(proc)
 
         handle = _registry.register(self.session_id, proc, command, str(cwd))
         managed = _registry.get(self.session_id, handle)
@@ -216,14 +322,16 @@ class ProcessMonitorTool:
             "pid": proc.pid,
             "command": command,
             "working_directory": str(cwd),
+            "shell": proc_lifecycle.shell_name(),
+            "hint": f"Poll with process_monitor read_output handle='{handle}'; stop with kill.",
         }
 
     def _status(self, handle: str) -> Dict[str, Any]:
         managed = _registry.get(self.session_id, handle)
         if not managed:
-            return {"success": False, "error": f"No process with handle '{handle}' in this session."}
+            return self._no_handle(handle)
 
-        exit_code = managed.proc.poll()
+        exit_code = managed.poll()
         running = exit_code is None
         uptime = time.time() - managed.started_at
 
@@ -237,56 +345,119 @@ class ProcessMonitorTool:
             "uptime_seconds": round(uptime, 1),
             "total_stdout_lines": managed.total_stdout_lines,
             "total_stderr_lines": managed.total_stderr_lines,
+            **self._orphan_fields(managed, exit_code),
+        }
+
+    @staticmethod
+    def _orphan_fields(managed: ManagedProcess, exit_code: Optional[int]) -> Dict[str, Any]:
+        """Extra keys when the shell wrapper exited but processes it
+        backgrounded are still running in its process group."""
+        if exit_code is None or not managed.group_alive():
+            return {}
+        return {
+            "background_children_running": True,
+            "note": "The shell wrapper exited but processes it started in the background "
+                    "are still running. Use kill on this handle to stop them.",
         }
 
     def _read_output(self, handle: str, offset: Optional[int],
                      max_lines: int, stream: str) -> Dict[str, Any]:
         managed = _registry.get(self.session_id, handle)
         if not managed:
-            return {"success": False, "error": f"No process with handle '{handle}' in this session."}
+            return self._no_handle(handle)
 
-        result: Dict[str, Any] = {"success": True, "handle": handle}
+        exit_code = managed.poll()
+        result: Dict[str, Any] = {
+            "success": True,
+            "handle": handle,
+            "running": exit_code is None,
+            "exit_code": exit_code,
+        }
 
+        streams = {
+            "stdout": (managed.stdout_buf, "total_stdout_lines"),
+            "stderr": (managed.stderr_buf, "total_stderr_lines"),
+        }
+        names = ["stdout", "stderr"] if stream == "both" else [stream]
         with managed._lock:
-            if stream in ("stdout", "both"):
-                result["stdout"] = self._extract_lines(
-                    managed.stdout_buf, managed.total_stdout_lines, offset, max_lines,
-                )
-            if stream in ("stderr", "both"):
-                result["stderr"] = self._extract_lines(
-                    managed.stderr_buf, managed.total_stderr_lines, offset, max_lines,
-                )
+            cursors = managed.read_cursor
+            totals = {name: getattr(managed, streams[name][1]) for name in names}
+            # stdout and stderr count lines independently, but the tool takes a
+            # single offset. In "both" mode a non-zero offset equal to either
+            # stream's last next_offset means "continue": each stream resumes
+            # from its own cursor. Any other value is an explicit position;
+            # one past a stream's end falls back to that stream's cursor (or
+            # its tail) rather than silently hiding its unread lines.
+            continuation = (
+                stream == "both" and offset is not None and offset != 0
+                and offset in (cursors["stdout"], cursors["stderr"])
+            )
+            for name in names:
+                buf = streams[name][0]
+                total = totals[name]
+                stream_offset = offset
+                if stream == "both" and offset is not None:
+                    if continuation:
+                        stream_offset = cursors[name] if cursors[name] is not None else 0
+                    elif offset > total:
+                        stream_offset = cursors[name]
+                res = self._extract_lines(buf, total, stream_offset, max_lines)
+                cursors[name] = res["next_offset"]
+                result[name] = res
 
+        if stream == "both":
+            result["offset_note"] = (
+                "stdout and stderr have separate offsets; passing either next_offset "
+                "continues each stream from where it was last read."
+            )
         return result
 
     def _kill(self, handle: str) -> Dict[str, Any]:
         managed = _registry.get(self.session_id, handle)
         if not managed:
-            return {"success": False, "error": f"No process with handle '{handle}' in this session."}
+            return self._no_handle(handle)
 
-        if managed.proc.poll() is not None:
+        if managed.poll() is not None:
+            # The shell wrapper exited, but backgrounded children in its
+            # process group may still be alive (e.g. `server &`): reap them too.
+            # group_alive() is latched, so a group already seen empty (whose
+            # pgid may since have been reused) is never signalled.
+            killed_children = False
+            if managed.group_alive():
+                try:
+                    proc_lifecycle.kill_tree_sync(managed.proc, term_grace=1.0, wait_grace=1.0)
+                    killed_children = True
+                except Exception:
+                    pass
+                managed.poll()  # re-probe the group; untracks it once empty
             return {
                 "success": True,
                 "handle": handle,
                 "already_exited": True,
                 "exit_code": managed.proc.returncode,
+                **({"killed_background_children": True} if killed_children else {}),
             }
 
-        managed.proc.terminate()
-        try:
-            managed.proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            managed.proc.kill()
-            try:
-                managed.proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
+        # Whole tree: SIGTERM the process group, escalate to SIGKILL after a
+        # grace period (Windows: taskkill /T /F).
+        proc_lifecycle.kill_tree_sync(managed.proc)
+        exit_code = managed.poll()
 
         return {
-            "success": True,
+            "success": exit_code is not None,
             "handle": handle,
-            "killed": True,
-            "exit_code": managed.proc.returncode,
+            "killed": exit_code is not None,
+            "exit_code": exit_code,
+            **({} if exit_code is not None else {"error": f"PID {managed.pid} did not exit after kill."}),
+        }
+
+    def _no_handle(self, handle: str) -> Dict[str, Any]:
+        known = [m.handle for m in _registry.list_for_session(self.session_id)]
+        return {
+            "success": False,
+            "error": f"No process with handle '{handle}' in this session.",
+            "known_handles": known,
+            "hint": "Use process_monitor list to see this session's handles.",
         }
 
     def _list(self) -> Dict[str, Any]:
@@ -294,15 +465,18 @@ class ProcessMonitorTool:
         procs = _registry.list_for_session(self.session_id)
         entries = []
         for m in procs:
-            exit_code = m.proc.poll()
-            entries.append({
+            exit_code = m.poll()
+            entry = {
                 "handle": m.handle,
                 "pid": m.pid,
                 "command": m.command[:100],
                 "running": exit_code is None,
                 "exit_code": exit_code,
                 "uptime_seconds": round(time.time() - m.started_at, 1),
-            })
+            }
+            if exit_code is not None and m.group_alive():
+                entry["background_children_running"] = True
+            entries.append(entry)
         return {"success": True, "processes": entries}
 
     # ------------------------------------------------------------------
@@ -340,6 +514,9 @@ class ProcessMonitorTool:
                 "note": f"{gap} lines were evicted from the buffer before they could be read.",
             }
 
+        # Never hand back a next_offset past the stream's end: a later read
+        # from it would skip lines written in between.
+        offset = min(offset, total)
         buf_offset = offset - oldest_available
         lines = buf_list[buf_offset:buf_offset + max_lines]
         return {
@@ -350,9 +527,11 @@ class ProcessMonitorTool:
         }
 
     def _resolve_working_directory(self, working_directory: Optional[str]) -> Path:
+        """Same rule as shell_exec: absolute as-is; relative from the session
+        workspace (else AGENT_DEFAULT_WORKSPACE); unset -> that base."""
         if not working_directory:
-            return self.workspace.resolve()
-        cwd = Path(working_directory).expanduser()
+            return Path(self.workspace).resolve()
+        cwd = Path(str(working_directory)).expanduser()
         if cwd.is_absolute():
             return cwd.resolve()
-        return (Path.cwd() / cwd).resolve()
+        return (Path(self.workspace) / cwd).resolve()

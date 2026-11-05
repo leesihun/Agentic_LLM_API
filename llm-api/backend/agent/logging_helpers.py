@@ -77,7 +77,15 @@ class LoggingMixin:
         for i, tc in enumerate(tool_calls, 1):
             lines.append(f"  [{i}] {tc.function.name} (id: {tc.id})")
             arg_cap = 500 if self._debug_logging_enabled() else 280
-            for k, v in tc.function.arguments.items():
+            args = tc.function.arguments
+            parse_error = getattr(tc.function, "parse_error", None)
+            if parse_error:
+                lines.append(f"      PARSE ERROR: {str(parse_error)[:arg_cap]}")
+            if isinstance(args, dict):
+                arg_items = list(args.items())
+            else:
+                arg_items = [("(non-dict arguments)", args)]
+            for k, v in arg_items:
                 sv = str(v)
                 if len(sv) > arg_cap:
                     sv = sv[:arg_cap] + f"... [{len(sv)} chars total]"

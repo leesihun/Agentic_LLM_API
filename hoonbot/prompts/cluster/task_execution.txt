@@ -28,6 +28,12 @@ Delegated task:
   test, smoke command, file existence).
 - Never include cluster tokens, API keys, `.env` contents, or full
   credential strings in the result.
+- This task is at the top of the message. The "Node context" section after
+  it is background about this node (its prompt and memory) — use it for
+  reference, but the delegated task above is what you must do.
+- Do not write task output, logs, transcripts, or status into this node's
+  memory file. Memory is for small, durable facts only and is size-capped;
+  put deliverables in the outbox and your answer in the result.
 
 # Delivering Files (this is how "send to the user" works)
 

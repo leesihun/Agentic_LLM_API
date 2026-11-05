@@ -19,14 +19,15 @@ reporting. Bundle multiple findings only if they are all real.
 3. **Cluster state** (if cluster mode is active) — known nodes healthy?
    Any task lease stuck or expired? Report node names and ages, not
    summaries.
-4. **Drift / risk signals** — disk pressure, memory file growing past
-   useful size, repeated webhook failures, broken bot registration.
+4. **Drift / risk signals** — disk pressure (<10% free on any mount),
+   memory.md over its soft cap (~8,000 chars), repeated webhook failures,
+   broken bot registration.
 
 # Reporting Rules
 
 - If everything in the priority list is healthy and there is nothing to
   follow up on, respond **exactly** with `HEARTBEAT_OK`. Nothing else.
-- For system health and memory review tasks, report the observed values under
+- For system health and status review tasks, report the observed values under
   `System Review` even when there is no alert; do not reduce those review
   tasks to `HEARTBEAT_OK`.
 - Do not send intermediate Messenger messages while running heartbeat tasks.
@@ -74,26 +75,29 @@ slave-02 expired; needs reassignment.
 
 This file is read every heartbeat interval.
 
-Your job is to find things to do yourself
-and actually, PROACTIVELY DO IT!!!
-
-You need to actually do the job, observe its output and report back what has been done!!!
-
-If there is a job that needs to be done in between this heartbeat and the previous one, do it yourself, proactively.
+Your job is to find things to do yourself and actually do them proactively:
+run the check, observe its output, and report what was done. If a job came
+due between the previous heartbeat and this one, do it now.
 
 ---
 
 ## Memory
 
-- Go through the memory and see if there's things to do. Note that heartbeat interval is limited and may require additional jobs.
-- Always display the full info to the user. Don't abbreviate or discard some information.
-- **Update memory fully** — after system health check, training status, and any other checks, write all fresh live data back to the memory file. Overwrite the stale sections completely. Do not keep old/stale values.
+- Read memory.md for open reminders, follow-ups, and recurring jobs that are
+  due. The heartbeat interval is limited — queue anything that cannot finish
+  this tick as a dated reminder.
+- Live status (GPU/RAM/disk numbers, training progress, service health,
+  last-run times) goes to the `status_file` (data/status.md): OVERWRITE it
+  each tick with the fresh values. Never append live status to memory.md.
+- memory.md holds durable facts only and must stay under ~8,000 chars (hard
+  cap 12,000). If it is over, prune or merge stale entries with `file_edit`
+  / `apply_patch`. Never paste logs, command output, or reports into it.
 
 ## Reminders
 
 - Check if any reminders are due. If so, queue the notification text for the
   final heartbeat report.
-- If a reminder has fired, remove it from the reminder list and update memory.
+- If a reminder has fired, remove it from the reminder list in memory.md.
 
 ## System Health
 
@@ -102,6 +106,8 @@ If there is a job that needs to be done in between this heartbeat and the previo
 - Run `df -h` for disk usage.
 - If GPU memory is critically low (<5% free on any GPU), alert immediately.
 - If any process has crashed or stalled, alert immediately.
+- Report the observed values in the System Review section of the report
+  (complete numbers, compact table or bullets) and in data/status.md.
 
 ## Priority Order
 
@@ -109,5 +115,5 @@ If there is a job that needs to be done in between this heartbeat and the previo
 2. System health (GPU, CPU, disk)
 3. Training status (live log tail)
 4. Reminders
-5. Memory update (write all fresh data)
-6. Memory review (display to user)
+5. Status update: overwrite data/status.md with this tick's live values
+6. Memory hygiene: memory.md under ~8,000 chars, stale entries pruned

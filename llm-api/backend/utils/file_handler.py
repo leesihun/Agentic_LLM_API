@@ -2,14 +2,94 @@
 File handling utilities for uploads
 """
 import base64
+import os
+import posixpath
+import re
 import shutil
 import json
 import csv
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from fastapi import UploadFile
 
 import config
+
+
+# Upload filename sanitising (save_uploaded_files). The name comes straight
+# from the multipart request, so it must never be trusted as a path.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+# Characters Windows refuses in a filename (':' would also open an NTFS
+# alternate data stream). Only replaced on Windows; Linux keeps them.
+_WINDOWS_BAD_CHARS_RE = re.compile(r'[<>:"|?*]')
+_WINDOWS_RESERVED_STEMS = {
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+}
+# Stay well under the usual 255-byte NAME_MAX, leaving room for a "_N" suffix.
+_MAX_NAME_BYTES = 200
+
+
+def _truncate_name(name: str) -> str:
+    """Shorten *name* to _MAX_NAME_BYTES (UTF-8), keeping a short extension."""
+    if len(name.encode("utf-8")) <= _MAX_NAME_BYTES:
+        return name
+    stem, ext = os.path.splitext(name)
+    if len(ext.encode("utf-8")) > 32:
+        ext = ""
+    budget = _MAX_NAME_BYTES - len(ext.encode("utf-8"))
+    stem = stem.encode("utf-8")[:budget].decode("utf-8", errors="ignore")
+    return stem + ext
+
+
+def sanitize_upload_filename(raw: Optional[str]) -> Optional[str]:
+    """Reduce a client-supplied upload filename to a safe bare file name.
+
+    Both '/' and '\\' are treated as separators and only the last component
+    is kept, NULs/control characters are removed, and the result is capped in
+    length. Returns None when nothing usable is left ('', '.', '..').
+    """
+    if raw is None:
+        return None
+    name = str(raw).replace("\\", "/")
+    # posixpath (not os.path): identical on every OS once '\\' is '/'. On
+    # Windows os.path would also split "C:name" at the drive; here ':' is
+    # replaced below instead.
+    name = posixpath.basename(name)
+    name = _CONTROL_CHARS_RE.sub("", name).strip()
+    if os.name == "nt":
+        name = _WINDOWS_BAD_CHARS_RE.sub("_", name)
+        # Windows silently drops trailing dots/spaces ("..." would name the
+        # directory itself).
+        name = name.rstrip(". ")
+        if name.split(".", 1)[0].strip().lower() in _WINDOWS_RESERVED_STEMS:
+            name = "_" + name
+    if name in ("", ".", ".."):
+        return None
+    name = _truncate_name(name)
+    if name in ("", ".", ".."):
+        return None
+    return name
+
+
+def _dedupe_name(name: str, used: Set[str]) -> str:
+    """Return *name*, or name_2.ext / name_3.ext ... if already in *used*.
+
+    Compared case-insensitively (Windows/macOS filesystems are), and the
+    chosen name is added to *used*.
+    """
+    candidate = name
+    if candidate.casefold() in used:
+        stem, ext = os.path.splitext(name)
+        n = 2
+        while True:
+            # name is <= _MAX_NAME_BYTES, so the suffix still fits NAME_MAX.
+            candidate = f"{stem}_{n}{ext}"
+            if candidate.casefold() not in used:
+                break
+            n += 1
+    used.add(candidate.casefold())
+    return candidate
 
 
 def is_image_file(file_path: str) -> bool:
@@ -82,7 +162,10 @@ def save_uploaded_files(
         session_id: Session ID for scratch storage
 
     Returns:
-        List of file paths in scratch directory
+        List of file paths in scratch directory. File names are sanitised
+        (sanitize_upload_filename) and de-duplicated within this call
+        (report.pdf, report_2.pdf, ...), so they can differ from the names
+        the client sent; files whose name is unusable are skipped.
     """
     scratch_paths = []
     max_bytes = config.MAX_FILE_SIZE_MB * 1024 * 1024
@@ -93,26 +176,41 @@ def save_uploaded_files(
 
     user_upload_dir.mkdir(parents=True, exist_ok=True)
     session_scratch_dir.mkdir(parents=True, exist_ok=True)
+    upload_root = user_upload_dir.resolve()
+    scratch_root = session_scratch_dir.resolve()
 
+    used_names: Set[str] = set()
     for i, file in enumerate(files):
         if file.filename:
+            safe_name = sanitize_upload_filename(file.filename)
+            if not safe_name:
+                print(f"[FILE_HANDLER] Skipping upload with unusable filename {file.filename!r}")
+                continue
+            safe_name = _dedupe_name(safe_name, used_names)
+            if safe_name != file.filename:
+                print(f"[FILE_HANDLER] Upload {file.filename!r} saved as {safe_name!r}")
             try:
-                user_file_path = user_upload_dir / file.filename
+                user_file_path = user_upload_dir / safe_name
+                scratch_file_path = session_scratch_dir / safe_name
+                # Belt and braces: the sanitised name must stay a direct child.
+                if (user_file_path.resolve().parent != upload_root
+                        or scratch_file_path.resolve().parent != scratch_root):
+                    raise ValueError(f"Upload filename {file.filename!r} escapes the upload directory")
+
                 with open(user_file_path, 'wb') as f:
                     shutil.copyfileobj(file.file, f)
                 user_size = user_file_path.stat().st_size
                 if user_size > max_bytes:
                     user_file_path.unlink()
                     raise ValueError(
-                        f"File '{file.filename}' exceeds the {config.MAX_FILE_SIZE_MB}MB limit"
+                        f"File '{safe_name}' exceeds the {config.MAX_FILE_SIZE_MB}MB limit"
                     )
 
-                scratch_file_path = session_scratch_dir / file.filename
                 shutil.copy2(user_file_path, scratch_file_path)
 
                 scratch_paths.append(str(scratch_file_path))
             except Exception as e:
-                print(f"[FILE_HANDLER] ERROR saving {file.filename}: {e}")
+                print(f"[FILE_HANDLER] ERROR saving {file.filename!r}: {e}")
                 import traceback
                 traceback.print_exc()
 

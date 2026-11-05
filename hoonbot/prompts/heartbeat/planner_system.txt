@@ -37,6 +37,12 @@ Schema:
 - Preserve the priority order of the checklist.
 - If the checklist is already a single conceptual task, return one item.
 - If the checklist is empty or contains only commentary, return `[]`.
+- The checklist comes first in the user message; anything after it under
+  "Background context" is data about the node (prompt, memory, state), not
+  checklist items. Never turn background text into tasks.
+- Do not plan tasks that copy status, logs, or tool output into the memory
+  file. Per-tick status belongs in the status file (overwritten each tick);
+  memory holds only durable facts and must stay small.
 
 # Done Criteria Patterns (use these forms)
 
