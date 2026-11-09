@@ -1,8 +1,10 @@
 """DispatchMixin: in-process tool execution with parallel support."""
 import asyncio
 import contextlib
+import contextvars
 import os
 import re
+import threading
 import time
 import uuid
 import weakref
@@ -10,6 +12,11 @@ from typing import Callable, Iterable, List, Dict, Any, Optional
 
 import config
 from backend.core.llm_backend import ToolCall, ToolStatusEvent
+from backend.agent import watchdog as _wd
+try:  # K2 contract (owned by the process-lifecycle partition): used defensively.
+    from backend.utils import proc_lifecycle as _proc_lifecycle
+except Exception:  # pragma: no cover - module always exists in this repo
+    _proc_lifecycle = None
 from pathlib import Path
 
 from tools.schemas import TOOL_METADATA
@@ -29,6 +36,127 @@ def _format_exception(exc: BaseException) -> str:
     msg = str(exc).strip()
     name = type(exc).__name__
     return f"{name}: {msg}" if msg else name
+
+
+# ---- Daemon-thread runner for in-process (blocking) tools -------------------
+# asyncio.to_thread uses the loop's small default executor: a few hung tool
+# threads (a thread cannot be killed) would saturate it and wedge EVERY later
+# to_thread call in the server. Tool work therefore runs on its own daemon
+# thread per call. The caller gets an asyncio.Future: cancelling / timing out
+# the await abandons the thread (its late result is dropped); being a daemon it
+# never blocks interpreter shutdown. The caller's contextvars (proc_lifecycle's
+# call context) are propagated like asyncio.to_thread does.
+def _to_tool_thread(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> "asyncio.Future":
+    loop = asyncio.get_running_loop()
+    fut: "asyncio.Future" = loop.create_future()
+    ctx = contextvars.copy_context()
+
+    def _deliver(result: Any, exc: Optional[BaseException]) -> None:
+        if fut.done():  # cancelled / timed out: late result is dropped
+            return
+        if exc is not None:
+            fut.set_exception(exc)
+        else:
+            fut.set_result(result)
+
+    def _run() -> None:
+        result: Any = None
+        exc: Optional[BaseException] = None
+        try:
+            result = ctx.run(fn, *args, **kwargs)
+        except BaseException as e:  # noqa: BLE001 - relayed to the awaiting task
+            exc = e if isinstance(e, Exception) else RuntimeError(f"{type(e).__name__}: {e}")
+        try:
+            loop.call_soon_threadsafe(_deliver, result, exc)
+        except RuntimeError:  # loop already closed (shutdown)
+            pass
+
+    name = getattr(fn, "__name__", "tool")
+    threading.Thread(target=_run, name=f"tool-{name}", daemon=True).start()
+    return fut
+
+
+# ---- proc_lifecycle call context (K2) — every use is defensive --------------
+def _enter_call_context(session_id: Optional[str], tool_call_id: str, tool_name: str) -> Any:
+    fn = getattr(_proc_lifecycle, "set_call_context", None) if _proc_lifecycle else None
+    if fn is None:
+        return None
+    try:
+        return fn(session_id, tool_call_id, tool_name)
+    except Exception:
+        return None
+
+
+def _exit_call_context(token: Any) -> None:
+    if token is None:
+        return
+    fn = getattr(_proc_lifecycle, "reset_call_context", None) if _proc_lifecycle else None
+    if fn is None:
+        return
+    try:
+        fn(token)
+    except Exception:  # token from another context / already reset
+        pass
+
+
+async def _kill_call_processes(tool_call_id: Optional[str], reason: str,
+                               session_id: Optional[str] = None,
+                               timeout: float = 10.0) -> int:
+    """Kill the process tree(s) registered for one tool call (scoped to
+    *session_id* so a reused call id in another session is never touched).
+    Never called without a tool_call_id (an empty filter would match every
+    process). Bounded: kill_processes runs its kills on the loop's shared
+    default executor, which hung threads can saturate; after *timeout* seconds
+    the kill is left to finish in the background and the caller moves on."""
+    fn = getattr(_proc_lifecycle, "kill_processes", None) if _proc_lifecycle else None
+    if fn is None or not tool_call_id:
+        return 0
+    kill_task: Optional["asyncio.Future"] = None
+    try:
+        kill_task = asyncio.ensure_future(fn(
+            session_id=session_id, tool_call_id=tool_call_id, reason=reason,
+            include_children_sessions=False,
+        ))
+        kill_task.add_done_callback(_swallow_task_exception)
+        done, _ = await asyncio.wait({kill_task}, timeout=timeout)
+        if kill_task in done and not kill_task.cancelled() and kill_task.exception() is None:
+            return int(kill_task.result() or 0)
+        return 0
+    except asyncio.CancelledError:
+        raise  # the kill task keeps running on its own
+    except Exception:
+        return 0
+
+
+def _swallow_task_exception(task: "asyncio.Future") -> None:
+    """done-callback for abandoned tasks (no 'exception never retrieved')."""
+    try:
+        if not task.cancelled():
+            task.exception()
+    except Exception:
+        pass
+
+
+class _ToolControl:
+    """Stop request channel between a tool's supervisor and its runner."""
+    __slots__ = ("event", "reason", "killed")
+
+    def __init__(self) -> None:
+        self.event = asyncio.Event()
+        self.reason: Optional[str] = None
+        self.killed: int = 0
+
+
+# Never judged by the LLM watchdog: subagents supervise themselves, and every
+# process_monitor operation is a quick call (its background processes live on).
+_UNSUPERVISED_TOOLS = frozenset({"agent", "process_monitor"})
+# Own timeouts/caps instead of the in-process hard timeout.
+_NO_HARD_TIMEOUT_TOOLS = frozenset({"shell_exec", "code_exec", "agent"})
+_STOP_HINT = (
+    "The call was stopped before it finished. Retry with a narrower path/pattern/scope or "
+    "a shorter timeout, use shell_exec (find/ls/rg) with a timeout, or run long jobs "
+    "through process_monitor."
+)
 
 
 def _process_owner_session(session_id: Optional[str]) -> Optional[str]:
@@ -56,6 +184,8 @@ _PATCH_PATH_RE = re.compile(
     r"^\s*\*\*\* (?:(?:Add|Delete|Update) File|Move to):\s*(.+?)\s*$", re.MULTILINE,
 )
 _FILE_MUTATING_TOOLS = frozenset({"file_edit", "file_writer", "apply_patch"})
+# Thread tools whose abandoned worker thread keeps writing after a stop/timeout.
+_BACKGROUND_CONTINUES_TOOLS = _FILE_MUTATING_TOOLS | frozenset({"rag"})
 
 
 def _path_lock(key: str) -> asyncio.Lock:
@@ -269,7 +399,7 @@ class DispatchMixin:
             return cached
 
         try:
-            result = await self._dispatch_tool(name, arguments, tool_call_id=tool_call_id)
+            result = await self._run_guarded_tool(name, arguments, tool_call_id=tool_call_id)
             if not isinstance(result, dict):
                 # Tools must return dicts; wrap anything else so downstream
                 # formatting (result.get(...)) can't crash the turn.
@@ -321,6 +451,397 @@ class DispatchMixin:
                 self.tool_calls_log = self.tool_calls_log[-200:]
             self._log_tool_result(name, tool_call_id, err_result, duration)
             return err_result
+
+    # ------------------------------------------------------------------
+    # Supervised execution: call context, registry, hard timeout, watchdog
+    # ------------------------------------------------------------------
+
+    def _child_session_map(self) -> Dict[str, str]:
+        m = getattr(self, "_agent_child_sessions", None)
+        if m is None:
+            m = {}
+            self._agent_child_sessions = m
+        return m
+
+    def _hard_timeout_seconds(self, name: str) -> Optional[float]:
+        """Wall-clock cap for in-process (thread) tools; None = the tool has
+        its own timeout (shell_exec / code_exec / agent)."""
+        if name in _NO_HARD_TIMEOUT_TOOLS:
+            return None
+        per_tool = getattr(config, "TOOL_HARD_TIMEOUTS", None) or {}
+        raw = per_tool.get(name, getattr(config, "TOOL_DEFAULT_HARD_TIMEOUT_SECONDS", 180))
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    @staticmethod
+    def _mark_stopped(result: Any, reason: str) -> Dict[str, Any]:
+        """Turn a (partial) tool result into the 'stopped by supervisor' result
+        fed back to the model: success False, the reason, and partial output."""
+        res: Dict[str, Any] = dict(result) if isinstance(result, dict) else {"output": result}
+        parts: List[str] = []
+        for key, cap in (("stdout", 600), ("output", 600), ("stderr", 300)):
+            v = res.get(key)
+            if isinstance(v, str) and v.strip():
+                parts.append(v.strip()[-cap:])
+                if key in ("stdout", "output"):
+                    break  # `output` duplicates stdout for some tools
+        msg = f"stopped by supervisor: {reason}"
+        if parts:
+            msg += "; partial output: " + " | ".join(parts)
+        res["success"] = False
+        res["error"] = msg
+        res["stopped_reason"] = reason
+        res.setdefault("hint", _STOP_HINT)
+        return res
+
+    async def _abandon_task(self, task: "asyncio.Future", wait: float = 5.0) -> None:
+        """Cancel *task* and give its cancellation cleanup a bounded time. A
+        thread-backed await is abandoned (the thread keeps running but its
+        result is dropped)."""
+        if task is None or task.done():
+            return
+        task.cancel()
+        task.add_done_callback(_swallow_task_exception)
+        with contextlib.suppress(Exception):
+            await asyncio.wait({task}, timeout=wait)
+
+    async def _run_guarded_tool(self, name: str, arguments: Dict[str, Any],
+                                tool_call_id: Optional[str] = None) -> Dict[str, Any]:
+        """_dispatch_tool under the live-visibility + backup system:
+
+        - tags child processes with (session, call id, tool) via proc_lifecycle's
+          call context and registers the call in the watchdog registry;
+        - enforces the hard wall-clock cap of in-process tools (structured error;
+          the worker thread is abandoned, never awaited forever);
+        - runs the supervisor (tool watchdog) as a background task that may stop
+          the call; a stopped call returns 'stopped by supervisor: <reason>;
+          partial output: ...' so the agent can adapt;
+        - is cancellation-safe: on cancel the tool task is cancelled AND awaited
+          (bounded) so process-tree kills finish before the turn lease is freed.
+        """
+        cid = tool_call_id or f"call_{uuid.uuid4().hex[:8]}"
+        detail = _wd.describe_call(name, arguments)
+        hard = self._hard_timeout_seconds(name)
+        ctl = _ToolControl()
+        started = time.monotonic()
+        token = _enter_call_context(self.session_id, cid, name)
+        _wd.register_tool(self.session_id, cid, name, detail)
+        inner: Optional[asyncio.Future] = None
+        sup: Optional[asyncio.Future] = None
+        stop_waiter: Optional[asyncio.Future] = None
+        try:
+            inner = asyncio.ensure_future(self._dispatch_tool(name, arguments, tool_call_id=tool_call_id))
+            stop_waiter = asyncio.ensure_future(ctl.event.wait())
+            if (
+                name not in _UNSUPERVISED_TOOLS
+                and getattr(config, "WATCHDOG_ENABLED", True)
+            ):
+                sup = asyncio.ensure_future(
+                    self._supervise_tool(ctl, name, cid, detail, started, arguments)
+                )
+            done, _ = await asyncio.wait(
+                {inner, stop_waiter}, timeout=hard, return_when=asyncio.FIRST_COMPLETED,
+            )
+            if inner in done:
+                result = inner.result()
+                if ctl.reason and isinstance(result, dict) and not result.get("success", True):
+                    result = self._mark_stopped(result, ctl.reason)
+                return result
+            if stop_waiter in done:
+                reason = ctl.reason or "stopped"
+                if ctl.killed:
+                    # The kill makes run_process return promptly with partial output.
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait({inner}, timeout=10)
+                    if inner.done() and not inner.cancelled() and inner.exception() is None:
+                        return self._mark_stopped(inner.result(), reason)
+                await self._abandon_task(inner)
+                await _kill_call_processes(cid, f"stopped by supervisor: {reason}", self.session_id)
+                stopped = self._mark_stopped({}, reason)
+                if name in _BACKGROUND_CONTINUES_TOOLS:
+                    # The worker thread cannot be killed: tell the model so it does
+                    # not blindly re-issue the same write / index job.
+                    stopped["error"] += (
+                        " The call may still complete in the background; verify the "
+                        "current state before repeating it."
+                    )
+                return stopped
+            # Hard timeout (hard is not None here): stop waiting, never hang the agent.
+            await self._abandon_task(inner)
+            await _kill_call_processes(cid, "tool timed out", self.session_id)
+            limit = int(hard) if float(hard).is_integer() else hard
+            note = (
+                " The call may still complete in the background."
+                if name in _BACKGROUND_CONTINUES_TOOLS else ""
+            )
+            reason = (
+                f"{name} timed out after {limit}s (still running in a background thread "
+                f"and was abandoned)"
+            )
+            return {
+                "success": False,
+                "error": reason + "." + note,
+                "stopped_reason": f"timed out after {limit}s",
+                "hint": "narrow the path/pattern, or use shell_exec (find/ls/rg) with a timeout",
+            }
+        except BaseException:
+            # Cancelled (stop / disconnect / deadline) or crashed: cancel the tool
+            # and wait (bounded) for its cleanup, e.g. process-tree kills.
+            if inner is not None and not inner.done():
+                inner.cancel()
+                inner.add_done_callback(_swallow_task_exception)
+                with contextlib.suppress(BaseException):
+                    await asyncio.wait({inner}, timeout=12)
+            raise
+        finally:
+            pending = [t for t in (sup, stop_waiter) if t is not None]
+            for t in pending:
+                if not t.done():
+                    t.cancel()
+                t.add_done_callback(_swallow_task_exception)
+            _wd.unregister_tool(cid, self.session_id)
+            _exit_call_context(token)
+            if tool_call_id:
+                self._child_session_map().pop(tool_call_id, None)
+
+    # ---- Tool watchdog (supervisor) -------------------------------------
+
+    def _request_headline(self, cap: int = 300) -> str:
+        """First chars of the user's latest request, for supervisor prompts."""
+        msgs = getattr(self, "_msgs_ref", None)
+        finder = getattr(self, "_find_last_user_message", None)
+        if not msgs or finder is None:
+            return ""
+        try:
+            found = finder(msgs)
+        except Exception:
+            return ""
+        if not found:
+            return ""
+        raw = found[1] or ""
+
+        def _clean(s: str) -> str:
+            s = re.sub(r"<[^>]{1,200}>", " ", s)
+            return re.sub(r"\s+", " ", s).strip()
+
+        def _clip(s: str, n: int) -> str:
+            return s[:n] + ("..." if len(s) > n else "")
+
+        # A merged / preempted turn arrives as labelled <message> blocks, oldest
+        # first, with the interrupted earlier request(s) flagged. The goal is the
+        # NEWEST request, so it leads the headline; the interrupted one follows.
+        blocks = re.findall(r"<message\b([^>]*)>(.*?)</message>", raw, flags=re.DOTALL)
+        if blocks:
+            latest = [_clean(b) for a, b in blocks if "interrupted-earlier-request" not in a]
+            earlier = [_clean(b) for a, b in blocks if "interrupted-earlier-request" in a]
+            latest_txt = _clean(" / ".join(t for t in latest if t))
+            earlier_txt = _clean(" / ".join(t for t in earlier if t))
+            if latest_txt and earlier_txt:
+                head = _clip(latest_txt, max(80, cap * 2 // 3))
+                tail_cap = max(40, cap - len(head))
+                return f"{head} (earlier, interrupted request: {_clip(earlier_txt, tail_cap)})"
+            return _clip(latest_txt or earlier_txt, cap)
+        text = re.sub(r"^\s*\[Room:[^\]]*\]", " ", raw)
+        return _clip(_clean(text), cap)
+
+    async def _supervisor_llm_text(self, system: str, user: str, agent_type: str) -> Optional[str]:
+        """One separate, tool-less, non-thinking supervisor LLM call. Returns the
+        reply text, or None on ANY failure / timeout (callers fail open).
+        Re-raises CancelledError so a finished tool / stopped turn aborts it."""
+        timeout = float(getattr(config, "WATCHDOG_LLM_TIMEOUT_SECONDS", 90))
+        kwargs = dict(
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            model=self.model,
+            temperature=0.0,
+            session_id=self.session_id,
+            agent_type=agent_type,
+            max_tokens=int(getattr(config, "WATCHDOG_MAX_TOKENS", 300)),
+        )
+        try:
+            try:
+                coro = self.llm.chat(chat_template_kwargs={"enable_thinking": False}, **kwargs)
+            except TypeError as te:
+                if "chat_template_kwargs" not in str(te):
+                    raise
+                coro = self.llm.chat(**kwargs)
+            resp = await asyncio.wait_for(coro, timeout=timeout)
+            return (getattr(resp, "content", None) or "").strip() or None
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._log(f"  [SUPERVISOR] {agent_type} call failed ({type(e).__name__}: {str(e)[:160]})")
+            return None
+
+    async def _watchdog_stop(self, ctl: "_ToolControl", cid: str, name: str, reason: str) -> None:
+        """Record the stop reason FIRST (so the runner labels the result), kill
+        the call's processes, then wake the runner."""
+        ctl.reason = reason
+        try:
+            self._watchdog_stops = getattr(self, "_watchdog_stops", 0) + 1
+        except Exception:
+            pass
+        self._log(f"  [WATCHDOG] stopping {name} ({cid}): {reason}")
+        # Wake the runner no matter how the kill goes: _kill_call_processes is
+        # bounded, and the event is set in `finally` so a slow/failed kill can
+        # never leave the call stuck as "running" (the runner abandons it).
+        try:
+            ctl.killed = await _kill_call_processes(
+                cid, f"stopped by supervisor: {reason}", self.session_id,
+            )
+        finally:
+            ctl.event.set()
+
+    @staticmethod
+    def _explicit_timeout(name: str, arguments: Any) -> Optional[float]:
+        """The `timeout` the model itself passed to shell_exec / code_exec
+        (None = it left the default). An explicit timeout is the model's own
+        bound and is respected by the supervisor."""
+        if name not in ("shell_exec", "code_exec") or not isinstance(arguments, dict):
+            return None
+        raw = arguments.get("timeout")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    @staticmethod
+    def _declared_timeout(name: str, explicit: Optional[float]) -> Optional[float]:
+        """Seconds after which the tool kills itself (explicit or default)."""
+        if explicit is not None:
+            return explicit
+        key = {"shell_exec": "SHELL_DEFAULT_TIMEOUT_SECONDS",
+               "code_exec": "CODE_EXEC_DEFAULT_TIMEOUT_SECONDS"}.get(name)
+        if key is None:
+            return None
+        try:
+            return float(getattr(config, key, 300))
+        except (TypeError, ValueError):
+            return None
+
+    async def _supervise_tool(self, ctl: "_ToolControl", name: str, cid: str,
+                              detail: str, started: float,
+                              arguments: Any = None) -> None:
+        """Background supervisor of ONE tool call (cancelled when the call ends).
+
+        Only calls with a live OS process are judged (an in-process thread tool
+        has no output signal and its own hard timeout). Deterministic rule (no
+        LLM): a foreground process silent for WATCHDOG_STALL_SECONDS is stopped,
+        unless the model passed an explicit `timeout` (its own bound stands: a
+        silent `python train.py > log` with timeout=3600 is legitimate). After
+        WATCHDOG_AFTER_SECONDS (then every WATCHDOG_INTERVAL_SECONDS) the
+        supervisor LLM is asked continue/stop, but only while the process has also
+        been silent for WATCHDOG_INTERVAL_SECONDS (a job that is printing is never
+        judged). Every failure means continue."""
+        try:
+            after = max(1.0, float(getattr(config, "WATCHDOG_AFTER_SECONDS", 180)))
+            interval = max(5.0, float(getattr(config, "WATCHDOG_INTERVAL_SECONDS", 120)))
+            stall = max(1.0, float(getattr(config, "WATCHDOG_STALL_SECONDS", 600)))
+            step = max(5.0, min(interval, 60.0))
+            explicit = self._explicit_timeout(name, arguments)
+            declared = self._declared_timeout(name, explicit)
+            checks = 0
+            last_llm: Optional[float] = None
+            await asyncio.sleep(min(after, stall))
+            while not ctl.event.is_set():
+                now = time.monotonic()
+                elapsed = now - started
+                procs = _wd.live_processes(
+                    tool_call_id=cid, session_id=self.session_id, include_children=False,
+                )
+                fg = [
+                    p for p in procs
+                    if isinstance(p, dict) and p.get("alive") is not False
+                    and p.get("tool") != "process_monitor"
+                ]
+                dead = _wd.stalled_process(fg, stall) if explicit is None else None
+                if dead is not None:
+                    idle = int(float(dead.get("idle_seconds") or dead.get("idle") or 0))
+                    await self._watchdog_stop(
+                        ctl, cid, name,
+                        f"no output for {idle}s (process pid {dead.get('pid')} looks stalled)",
+                    )
+                    return
+                min_idle = min(
+                    (float(p.get("idle_seconds") or 0.0) for p in fg), default=0.0,
+                )
+                if (
+                    fg
+                    and min_idle >= interval
+                    and elapsed >= after
+                    and (last_llm is None or now - last_llm >= interval)
+                ):
+                    checks += 1
+                    last_llm = now
+                    reply = await self._supervisor_llm_text(
+                        _wd.TOOL_REVIEW_SYSTEM,
+                        _wd.build_tool_review_prompt(
+                            name, detail, elapsed, checks, self._request_headline(),
+                            procs, declared_timeout=declared,
+                            explicit_timeout=explicit is not None,
+                        ),
+                        "agent:watchdog",
+                    )
+                    action, reason = _wd.parse_tool_verdict(reply)
+                    if action == "stop":
+                        # The verdict can be ~90s old: if the process printed
+                        # something since the snapshot, it is alive - keep waiting.
+                        fresh = [
+                            p for p in _wd.live_processes(
+                                tool_call_id=cid, session_id=self.session_id,
+                                include_children=False,
+                            )
+                            if isinstance(p, dict) and p.get("alive") is not False
+                            and p.get("tool") != "process_monitor"
+                        ]
+                        if fresh and min(
+                            float(p.get("idle_seconds") or 0.0) for p in fresh
+                        ) < min(30.0, interval):
+                            action = "continue"
+                    if action == "stop":
+                        await self._watchdog_stop(ctl, cid, name, reason or "judged stuck by the supervisor")
+                        return
+                await asyncio.sleep(step)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # supervisor bugs must never touch the tool
+            self._log(f"  [WATCHDOG] supervisor for {name} crashed ({type(e).__name__}: {e}) - ignoring")
+
+    def _make_progress_event(self, tc: ToolCall) -> ToolStatusEvent:
+        """A status="progress" event for a still-running tool call (K1)."""
+        name = tc.function.name
+        cid = tc.id
+        now = time.monotonic()
+        launch = (getattr(self, "_tool_launch_times", None) or {}).get(cid, now)
+        meta = TOOL_METADATA.get(name, {})
+        procs: List[Dict[str, Any]] = []
+        try:
+            if name == "agent":
+                child = self._child_session_map().get(cid)
+                if child:
+                    procs = _wd.live_processes(session_id=child, include_children=True)
+            elif cid:
+                procs = _wd.live_processes(
+                    tool_call_id=cid, session_id=self.session_id, include_children=False,
+                )
+        except Exception:
+            procs = []
+        return ToolStatusEvent(
+            tool_name=name,
+            tool_call_id=cid,
+            status="progress",
+            activity=meta.get("activity", ""),
+            user_name=meta.get("user_name", ""),
+            detail=_wd.describe_call(name, tc.function.arguments),
+            elapsed=round(max(0.0, now - launch), 1),
+            processes=_wd.trim_processes(procs),
+        )
 
     def _track_temp_files(self, name: str, result: Dict[str, Any]) -> None:
         """Register newly-created files (not flagged persist=True) for cleanup
@@ -493,11 +1014,11 @@ class DispatchMixin:
         """Run a file-mutating tool call in a thread while holding the
         process-wide locks for every file it targets."""
         try:
-            keys = await asyncio.to_thread(self._write_lock_keys, name, tool, arguments)
+            keys = await _to_tool_thread(self._write_lock_keys, name, tool, arguments)
         except Exception:
             keys = []
         async with _hold_path_locks(keys):
-            fut = asyncio.ensure_future(asyncio.to_thread(fn, **kwargs))
+            fut = _to_tool_thread(fn, **kwargs)
             try:
                 return await asyncio.shield(fut)
             except asyncio.CancelledError:
@@ -535,7 +1056,7 @@ class DispatchMixin:
             if "websearch" not in cache:
                 from tools.web_search import WebSearchTool
                 cache["websearch"] = WebSearchTool()
-            return await asyncio.to_thread(
+            return await _to_tool_thread(
                 cache["websearch"].search,
                 query=arguments["query"],
                 max_results=arguments.get("max_results"),
@@ -582,7 +1103,7 @@ class DispatchMixin:
                     "available_collections": available_collections,
                 }
 
-            return await asyncio.to_thread(
+            return await _to_tool_thread(
                 cache["rag"].retrieve,
                 collection_name=requested_collection,
                 query=arguments["query"],
@@ -596,7 +1117,7 @@ class DispatchMixin:
                     username=self.username, session_id=self.session_id,
                     workspace_dir=self.workspace_dir,
                 )
-            return await asyncio.to_thread(
+            return await _to_tool_thread(
                 cache["file_reader"].read,
                 path=arguments["path"],
                 offset=arguments.get("offset"),
@@ -637,7 +1158,7 @@ class DispatchMixin:
             if "shell_lint" not in cache:
                 from tools.shell.lint import ShellLintTool
                 cache["shell_lint"] = ShellLintTool(workspace_dir=self._workspace_str())
-            return await asyncio.to_thread(
+            return await _to_tool_thread(
                 cache["shell_lint"].lint,
                 path=arguments["path"],
             )
@@ -649,7 +1170,7 @@ class DispatchMixin:
                     username=self.username, session_id=self.session_id,
                     workspace_dir=self.workspace_dir,
                 )
-            return await asyncio.to_thread(
+            return await _to_tool_thread(
                 cache["file_navigator"].navigate,
                 operation=arguments["operation"],
                 path=arguments.get("path"),
@@ -681,7 +1202,7 @@ class DispatchMixin:
             if "memo" not in cache:
                 from tools.memo import MemoTool
                 cache["memo"] = MemoTool(username=self.username)
-            return await asyncio.to_thread(
+            return await _to_tool_thread(
                 cache["memo"].execute,
                 operation=arguments["operation"],
                 key=arguments.get("key"),
@@ -702,7 +1223,7 @@ class DispatchMixin:
             # The model routinely omits max_lines/stream; passing None through
             # as an explicit kwarg defeats the tool's own defaults (stream=None
             # returned no output at all), so default them here.
-            return await asyncio.to_thread(
+            return await _to_tool_thread(
                 cache["process_monitor"].execute,
                 operation=arguments["operation"],
                 command=arguments.get("command"),
@@ -736,8 +1257,11 @@ class DispatchMixin:
         elif name == "grep":
             if "grep" not in cache:
                 from tools.grep import GrepTool
-                cache["grep"] = GrepTool()
-            return await asyncio.to_thread(
+                cache["grep"] = GrepTool(
+                    username=self.username, session_id=self.session_id,
+                    workspace_dir=self.workspace_dir,
+                )
+            return await _to_tool_thread(
                 cache["grep"].search,
                 pattern=arguments["pattern"],
                 path=arguments.get("path"),
@@ -757,7 +1281,7 @@ class DispatchMixin:
             if "todo_write" not in cache:
                 from tools.todo import TodoTool
                 cache["todo_write"] = TodoTool()
-            result = await asyncio.to_thread(
+            result = await _to_tool_thread(
                 cache["todo_write"].write,
                 todos=arguments.get("todos", []),
             )
@@ -779,6 +1303,8 @@ class DispatchMixin:
             # (no "::" — unsafe in Windows filenames); the stop-signal helper
             # maps it back to the parent prefix before `__sub_`.
             child_session_id = f"{self.session_id or 'ephemeral'}__sub_{uuid.uuid4().hex[:8]}"
+            if tool_call_id:  # lets progress events show the child's live processes
+                self._child_session_map()[tool_call_id] = child_session_id
             # SubAgentTool.execute is async — await directly (not to_thread)
             return await cache["agent"].execute(
                 prompt=arguments["prompt"],

@@ -120,6 +120,10 @@ async def _run_job(
                     job_store.append_chunk(job_id, event.content)
                     _signal_job(job_id)
                 elif isinstance(event, ToolStatusEvent):
+                    if str(getattr(event, "status", "") or "").lower() == "progress":
+                        # Live "still running" ticks (K1) are for streaming
+                        # clients; they would only bloat the job's event log.
+                        continue
                     job_store.append_tool_event(
                         job_id,
                         tool_name=event.tool_name,

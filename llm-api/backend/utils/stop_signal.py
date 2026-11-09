@@ -18,7 +18,9 @@ Per-session marker lifecycle:
     `{parent}::{call_id}`). A child observes its parent's marker WITHOUT
     consuming it — every sibling and the parent itself must still see it.
 """
-from typing import List, Optional
+import threading
+import time
+from typing import Dict, List, Optional
 
 import config
 
@@ -26,6 +28,18 @@ import config
 # Child-session separators, newest first. "__sub_" is filename-safe on
 # Windows; "::" is the legacy form (kept so old ids still resolve).
 _CHILD_SEPARATORS = ("__sub_", "::")
+
+
+# In-memory record of when each session last had a stop requested (monotonic
+# seconds). The chat route uses it to tell "stopped on request" (e.g. a newer
+# message preempted the turn) from a plain client disconnect when it writes the
+# "[interrupted]" marker into history. Process-local (SERVER_WORKERS=1) and
+# purely informational: the on-disk marker stays the source of truth for
+# actually halting a run.
+_STOP_TIMES: Dict[str, float] = {}
+_STOP_TIMES_LOCK = threading.Lock()
+_STOP_TIMES_MAX = 512
+_STOP_TIMES_TTL_SECONDS = 3600.0
 
 
 class StopInferenceError(Exception):
@@ -145,7 +159,32 @@ def request_session_stop(session_id: str) -> None:
     """Signal a single session's agent loop (and its subagents) to halt at the next checkpoint."""
     config.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     _session_stop_path(session_id).touch()
+    _note_stop_time(session_id)
     print(f"[STOP] Session stop requested: {session_id}")
+
+
+def _note_stop_time(session_id: str) -> None:
+    now = time.monotonic()
+    with _STOP_TIMES_LOCK:
+        _STOP_TIMES[session_id] = now
+        if len(_STOP_TIMES) > _STOP_TIMES_MAX:
+            cutoff = now - _STOP_TIMES_TTL_SECONDS
+            for sid in [k for k, v in _STOP_TIMES.items() if v < cutoff]:
+                _STOP_TIMES.pop(sid, None)
+            # Still too many (burst of distinct sessions): drop the oldest.
+            while len(_STOP_TIMES) > _STOP_TIMES_MAX:
+                oldest = min(_STOP_TIMES, key=_STOP_TIMES.get)
+                _STOP_TIMES.pop(oldest, None)
+
+
+def session_stop_requested_since(session_id: str, since_monotonic: float) -> bool:
+    """True if a stop was requested for *session_id* at/after `since_monotonic`
+    (a `time.monotonic()` reading). Never consumes anything."""
+    if not session_id:
+        return False
+    with _STOP_TIMES_LOCK:
+        stamp = _STOP_TIMES.get(session_id)
+    return stamp is not None and stamp >= since_monotonic
 
 
 def clear_session_stop(session_id: str) -> bool:

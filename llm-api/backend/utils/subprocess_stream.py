@@ -33,6 +33,8 @@ class StreamResult:
     drain_incomplete: bool = False
     duration: float = 0.0
     notes: List[str] = field(default_factory=list)
+    stopped: bool = False       # killed by kill_processes() (user stop / supervisor)
+    stop_reason: str = ""
 
 
 async def run_streaming(
@@ -45,6 +47,8 @@ async def run_streaming(
     env: Optional[Dict[str, str]] = None,
     head_bytes: Optional[int] = None,
     tail_bytes: Optional[int] = None,
+    display_command: Optional[str] = None,
+    tool: Optional[str] = None,
 ) -> StreamResult:
     """Run a program asynchronously, streaming both stdout and stderr.
 
@@ -52,6 +56,10 @@ async def run_streaming(
     OR `idle_timeout` seconds pass with no new output (whichever fires first).
     Returns whatever was streamed up to that point (timed_out=True). Output is
     kept head+tail, each part bounded by `max_output_size`.
+
+    display_command / tool label the process in the live registry
+    (proc_lifecycle.snapshot_processes); a kill_processes() stop is reported
+    via stopped / stop_reason.
     """
     cap = max(1, int(max_output_size or 1))
     head = min(cap, head_bytes or proc_lifecycle.DEFAULT_HEAD_BYTES)
@@ -64,6 +72,8 @@ async def run_streaming(
         idle_timeout=idle_timeout,
         head_bytes=head,
         tail_bytes=tail,
+        display_command=display_command,
+        tool=tool,
     )
     return StreamResult(
         stdout=res.stdout,
@@ -77,4 +87,6 @@ async def run_streaming(
         drain_incomplete=res.drain_incomplete,
         duration=res.duration,
         notes=list(res.notes),
+        stopped=res.stopped,
+        stop_reason=res.stop_reason,
     )

@@ -349,7 +349,7 @@ personality.
   do proactive work and report into a home room — a self-driving assistant.
 - **🎯 Sticky goal mode** — `/goal <task>` puts a room into a persistent,
   goal-focused mode that forwards `mode="goal"` on every turn until `/goal off`.
-- **⚡ Inline controls** — `@stop`, `@clear`, `@compact` to steer a conversation
+- **⚡ Inline controls** — `@stop`, `@status`, `@clear`, `@compact` to steer a conversation; a new message mid-turn preempts the running one
   mid-flight; smart debouncing coalesces rapid-fire messages.
 - **🧰 Skills** — plain-Markdown playbooks in `hoonbot/skills/` (diagnose the
   system, manage webhooks, summarize a room, set reminders, search messages,

@@ -9,12 +9,28 @@ This module provides:
 - near_matches():     basenames within Levenshtein <= max_distance of a target
 - deepest_ancestor(): deepest existing directory along a non-resolving path
 - build_failure_report(): assembled structured failure dict
+
+and the primitives that keep every filesystem tool BOUNDED (a tool call that
+never returns used to freeze the whole turn):
+- Deadline:     cooperative wall-clock budget + cancel flag (also cancelled by
+                proc_lifecycle.kill_processes() on a user stop / supervisor stop)
+- run_bounded:  run a callable in a daemon thread and give up after a timeout
+                (a syscall stuck on a dead network mount cannot be interrupted;
+                the abandoned thread dies with the process)
+- scan_entries: os.scandir with an entry cap and deadline checks
+- HEAVY_DIRS:   directories never descended into unless explicitly targeted
 """
+import contextvars
+import os
+import threading
+import time
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Any
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import config
 
+
+IS_WINDOWS = os.name == "nt"
 
 _SKIP_DIRS = {
     ".git", ".hg", ".svn", "__pycache__", "node_modules",
@@ -22,6 +38,161 @@ _SKIP_DIRS = {
     ".pytest_cache", ".mypy_cache", "data",
 }
 
+# Never descended into by recursive navigation (tree / ** search / python grep)
+# unless the caller's path or pattern names them explicitly.
+HEAVY_DIRS = frozenset({
+    "node_modules", ".git", ".hg", ".svn", "__pycache__", ".venv", "venv",
+    "dist", "build", ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    ".gradle", ".idea",
+})
+
+
+# ======================================================================
+# Bounded-work primitives
+# ======================================================================
+
+class Deadline:
+    """Wall-clock budget + cancel flag, checked cooperatively inside loops.
+
+    Registers a cancel hook with proc_lifecycle (when importable) so that
+    kill_processes() for this tool call / session — user @stop, supervisor
+    verdict — makes the loop stop within a few entries instead of running on
+    in an abandoned thread. Use as a context manager (or call close())."""
+
+    def __init__(self, seconds: float, *, hook: bool = True):
+        self.seconds = max(0.1, float(seconds))
+        self._end = time.monotonic() + self.seconds
+        self._cancelled = threading.Event()
+        self._hook: Optional[int] = None
+        if hook:
+            try:
+                from backend.utils import proc_lifecycle
+                self._hook = proc_lifecycle.register_cancel_hook(self.cancel)
+            except Exception:
+                self._hook = None
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled.is_set()
+
+    @property
+    def expired(self) -> bool:
+        return self._cancelled.is_set() or time.monotonic() >= self._end
+
+    def remaining(self) -> float:
+        return max(0.0, self._end - time.monotonic())
+
+    def reason(self) -> str:
+        if self._cancelled.is_set():
+            return "stopped (cancelled)"
+        return f"time limit {self.seconds:g}s reached"
+
+    def close(self) -> None:
+        hook, self._hook = self._hook, None
+        if hook is not None:
+            try:
+                from backend.utils import proc_lifecycle
+                proc_lifecycle.unregister_cancel_hook(hook)
+            except Exception:
+                pass
+
+    def __enter__(self) -> "Deadline":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+
+def run_bounded(
+    fn: Callable[..., Any],
+    *args: Any,
+    timeout: float,
+    cancel: Optional[Deadline] = None,
+    name: str = "op",
+    **kwargs: Any,
+) -> Tuple[bool, Any]:
+    """Run fn(*args, **kwargs) in a daemon thread; wait at most *timeout*.
+
+    Returns (True, value) when it finished (re-raising its exception), or
+    (False, None) after cancelling *cancel* if it is still running — e.g.
+    blocked in a syscall on a hung mount. The call context (session / tool
+    call id) is propagated into the thread."""
+    box: List[Tuple[bool, Any]] = []
+    ctx = contextvars.copy_context()
+
+    def target() -> None:
+        try:
+            box.append((True, ctx.run(fn, *args, **kwargs)))
+        except BaseException as exc:  # noqa: BLE001 - re-raised in the caller
+            box.append((False, exc))
+
+    thread = threading.Thread(target=target, name=f"bounded-{name}", daemon=True)
+    thread.start()
+    thread.join(max(0.1, float(timeout)))
+    if thread.is_alive() or not box:
+        if cancel is not None:
+            cancel.cancel()
+        return False, None
+    ok, value = box[0]
+    if not ok:
+        raise value
+    return True, value
+
+
+def scan_entries(
+    path: Any,
+    deadline: Optional[Deadline],
+    limit: int,
+) -> Tuple[List["os.DirEntry[str]"], Optional[str], Optional[str]]:
+    """os.scandir(path) capped at *limit* entries with deadline checks.
+
+    Returns (entries, truncated_reason_or_None, os_error_message_or_None)."""
+    entries: List["os.DirEntry[str]"] = []
+    reason: Optional[str] = None
+    error: Optional[str] = None
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                if len(entries) >= limit:
+                    reason = f"entry limit ({limit}) reached"
+                    break
+                entries.append(entry)
+                if deadline is not None and (len(entries) & 127) == 0 and deadline.expired:
+                    reason = deadline.reason()
+                    break
+    except OSError as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    return entries, reason, error
+
+
+def entry_is_dir(entry: "os.DirEntry[str]") -> bool:
+    try:
+        return entry.is_dir()
+    except OSError:
+        return False
+
+
+def entry_is_real_dir(entry: "os.DirEntry[str]") -> bool:
+    """Directory that is not a symlink (os.walk(followlinks=False) rule)."""
+    try:
+        return entry.is_dir(follow_symlinks=False) and not entry.is_symlink()
+    except OSError:
+        return False
+
+
+def realpath_key(path: str) -> str:
+    try:
+        return os.path.normcase(os.path.realpath(path))
+    except OSError:
+        return os.path.normcase(path)
+
+
+# ======================================================================
+# Path resolution / failure reports
+# ======================================================================
 
 def candidate_roots(
     workspace_dir: Optional[Path],
@@ -75,41 +246,56 @@ def near_matches(
     max_distance: int = 2,
     max_depth: int = 3,
     cap: int = 10,
+    time_budget: float = 4.0,
+    max_visited: int = 20000,
 ) -> List[str]:
     """Return up to *cap* file paths whose basename is within Levenshtein
     *max_distance* of *basename*. Walks at most *max_depth* levels below
-    *search_root*, skipping VCS / build / cache directories.
+    *search_root*, pruning VCS / build / cache directories BEFORE descending,
+    never following symlinks, and giving up after *time_budget* seconds or
+    *max_visited* directory entries (this runs on every "file not found", often
+    rooted at a huge home directory — it must stay cheap).
 
     Returned paths are relative to *search_root* when possible, otherwise
     absolute. Case-insensitive comparison.
     """
-    if not search_root.is_dir():
+    try:
+        if not search_root.is_dir():
+            return []
+    except OSError:
         return []
     target = basename.casefold()
-    root_parts = len(search_root.parts)
+    root_str = str(search_root)
     matches: List[Tuple[int, str]] = []
+    visited = 0
+    deadline = Deadline(time_budget, hook=False)
+    stack: List[Tuple[str, int]] = [(root_str, 0)]
 
-    try:
-        for path in search_root.rglob("*"):
-            if not path.is_file():
+    while stack and len(matches) < cap * 4 and visited < max_visited and not deadline.expired:
+        current, level = stack.pop()
+        entries, _reason, _err = scan_entries(current, deadline, 5000)
+        subdirs: List[str] = []
+        for entry in entries:
+            visited += 1
+            name = entry.name
+            if level < max_depth and name not in _SKIP_DIRS and entry_is_real_dir(entry):
+                subdirs.append(entry.path)
                 continue
-            depth = len(path.parts) - root_parts - 1
-            if depth > max_depth:
-                continue
-            if any(part in _SKIP_DIRS for part in path.parts[root_parts:-1]):
-                continue
-            name = path.name.casefold()
-            dist = _bounded_levenshtein(target, name, max_distance)
+            dist = _bounded_levenshtein(target, name.casefold(), max_distance)
             if dist <= max_distance:
                 try:
-                    rel = str(path.relative_to(search_root))
+                    if not entry.is_file():
+                        continue
+                except OSError:
+                    continue
+                try:
+                    rel = os.path.relpath(entry.path, root_str)
                 except ValueError:
-                    rel = str(path)
+                    rel = entry.path
                 matches.append((dist, rel))
-                if len(matches) >= cap * 4:
-                    break
-    except (PermissionError, OSError):
-        pass
+        # Visit shallow directories first-ish: push in reverse so sorted order pops first.
+        for sub in sorted(subdirs, reverse=True):
+            stack.append((sub, level + 1))
 
     matches.sort(key=lambda pair: (pair[0], pair[1]))
     return [path for _, path in matches[:cap]]
@@ -121,22 +307,25 @@ def deepest_ancestor(requested: Path) -> Tuple[Optional[Path], List[str]]:
     (rare — root usually exists). top_entries is up to 10 sorted entries
     of that directory, dirs suffixed with '/'."""
     current = requested
-    while current and not current.exists():
-        parent = current.parent
-        if parent == current:
-            return None, []
-        current = parent
-    if not current.is_dir():
-        return current, []
     try:
-        entries = sorted(current.iterdir(), key=lambda p: (not p.is_dir(), p.name))
-        formatted = [
-            f"{p.name}/" if p.is_dir() else p.name
-            for p in entries[:10]
-        ]
-        return current, formatted
-    except (PermissionError, OSError):
+        while current and not current.exists():
+            parent = current.parent
+            if parent == current:
+                return None, []
+            current = parent
+        if not current.is_dir():
+            return current, []
+    except OSError:
+        return None, []
+    # Bounded listing: a directory with millions of entries must not stall the
+    # failure report. The first 2000 entries (dirs first, then by name) are
+    # plenty to show 10.
+    entries, _reason, _err = scan_entries(current, Deadline(2.0, hook=False), 2000)
+    if _err and not entries:
         return current, []
+    ordered = sorted(entries, key=lambda e: (not entry_is_dir(e), e.name))
+    formatted = [f"{e.name}/" if entry_is_dir(e) else e.name for e in ordered[:10]]
+    return current, formatted
 
 
 def build_failure_report(

@@ -587,6 +587,65 @@ class StreamChat:
         raise self._error("stream ended unexpectedly (no [DONE])")
 
 
+# ---------------------------------------------------------------------------
+# Session control (stop / live activity) — best effort, never raise
+# ---------------------------------------------------------------------------
+
+def _auth_headers() -> dict:
+    return {"Authorization": f"Bearer {config.LLM_API_KEY}"}
+
+
+async def stop_session(session_id: Optional[str], timeout: float = 10.0, kind: str = "interactive") -> bool:
+    """POST /api/chat/sessions/{id}/stop. True when llm-api acknowledged it.
+
+    Best effort: the server writes the stop marker and kills the session's
+    running tool processes so the turn (and its lease) wind down quickly.
+    Never raises (cancellation excepted).
+    """
+    if not session_id:
+        return False
+    try:
+        resp = await get_client(kind).post(
+            f"{config.LLM_API_URL}/api/chat/sessions/{session_id}/stop",
+            headers=_auth_headers(),
+            timeout=timeout,
+        )
+        if resp.status_code >= 400:
+            logger.warning(f"[LLM] stop_session({session_id}) -> HTTP {resp.status_code}")
+            return False
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(f"[LLM] stop_session({session_id}) failed: {type(exc).__name__}: {exc}")
+        return False
+
+
+async def get_activity(session_id: Optional[str], timeout: float = 4.0, kind: str = "interactive") -> Optional[dict]:
+    """GET /api/chat/sessions/{id}/activity -> ``{"busy", "turn", "tools", "processes", ...}``.
+
+    Short timeout; returns None when the session/endpoint is unavailable or on
+    any error. Never raises (cancellation excepted).
+    """
+    if not session_id:
+        return None
+    try:
+        resp = await get_client(kind).get(
+            f"{config.LLM_API_URL}/api/chat/sessions/{session_id}/activity",
+            headers=_auth_headers(),
+            timeout=timeout,
+        )
+        if resp.status_code >= 400:
+            return None
+        body = resp.json()
+        return body if isinstance(body, dict) else None
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.debug(f"[LLM] get_activity({session_id}) failed: {type(exc).__name__}: {exc}")
+        return None
+
+
 def stream_chat(
     payload: dict,
     headers: dict,

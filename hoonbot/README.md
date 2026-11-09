@@ -53,7 +53,7 @@ holds advanced tuning.
 | `HEARTBEAT_ENABLED` | `True` | Proactive heartbeat task loop |
 | `HEARTBEAT_INTERVAL_SECONDS` | `3600` (cluster_config) | Time between heartbeat ticks |
 | `DEBOUNCE_SECONDS` | `1.5` | Quiet window that gathers a burst into one queued batch |
-| `FOLLOWUP_POLICY` | `queue` | Messages sent while a turn runs: `queue` for the next turn, or `interrupt` (same-sender follow-ups cancel + merge) |
+| `FOLLOWUP_POLICY` | `preempt` | Messages sent while a turn runs: `preempt` (default: stop the running turn, then answer the interrupted and new messages together), `queue` (wait for the next turn) or `interrupt` (same-sender follow-ups cancel + merge). A finalizing, delegating or `@compact` turn is never preempted and falls back to `queue` |
 | `ROOM_QUEUE_MAX` / `BATCH_MAX_MESSAGES` | `50` / `20` | Per-room queue bound / messages answered per turn |
 | `LLM_TIMEOUT_SECONDS` | `3600` | Wall-clock cap for non-streaming calls; streaming uses the idle watchdog below |
 | `LLM_STREAM_IDLE_TIMEOUT_SECONDS` | `900` | Abort a stream only after this long with no bytes (SSE keepalives count) |
@@ -121,8 +121,9 @@ Messenger UI
 handlers/webhook.py
     ├── validate (text/image/file, not bot, @mention if non-home room)
     ├── mark_read
-    ├── @stop / @clear run immediately; everything else enters the room queue
+    ├── @stop / @status / @clear run immediately; everything else enters the room queue
     ├── debounce, then take queued messages as one labelled batch
+    │   (a message arriving mid-turn preempts the running turn under FOLLOWUP_POLICY=preempt)
     └── process_message()
             │  POST /v1/chat/completions
             ▼
@@ -153,5 +154,6 @@ python3 scripts/setup_credentials.py
 - **Memory path must be absolute** — injected into system prompt so the LLM can use file_reader/file_writer tools. `config.DATA_DIR` is resolved at import time; don't move `data/` after startup without restarting.
 - **memory.md is capped** — the injected copy is cut to `MEMORY_MAX_CHARS` (head + `## Reminders`, with a truncation marker), and `core/memory_guard.py` condenses the file itself when it passes `MEMORY_SOFT_CHARS` (at startup, every heartbeat tick, after a turn, and on context overflow). Each condense first copies the old file to `data/memory_backups/`; restore by copying a backup back over `data/memory.md`. Live status belongs in `data/status.md`.
 - **Bot API key survives restarts** — stored in `data/.apikey`. Delete it to force re-registration with Messenger.
-- **Streaming requires LLM API SSE support** — if the LLM API doesn't return `tool_status` events, tool-status messages won't appear, but the final reply still sends.
+- **Streaming requires LLM API SSE support** — if the LLM API doesn't return `tool_status` events, tool-status messages won't appear, but the final reply still sends. Long-running tools also send `progress` events; the typing indicator and the in-bubble worklog then show elapsed time, the call detail and live processes (with how long they have been silent).
+- **`@status`** (or `/status`) answers at once, even mid-turn, with what the room is doing: whether a turn is running and for how long, how many messages are queued, and the running tools and processes reported by the LLM API. It never interrupts the running turn.
 - **Heartbeat first tick is delayed** — runs after one full interval at startup, never immediately.

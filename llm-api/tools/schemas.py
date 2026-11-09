@@ -290,7 +290,8 @@ TOOL_SCHEMAS: dict = {
         "name": "grep",
         "description": (
             "ripgrep content search. Supports full regex, glob filters, and file-type "
-            "filters. Output modes: 'files_with_matches' (default, just paths), "
+            "filters. Directories like node_modules, dist, build, venv, __pycache__ and VCS dirs are "
+            "skipped at any depth unless named in `path`/`glob`. Output modes: 'files_with_matches' (default, just paths), "
             "'content' (matching lines, supports -A/-B/-C), 'count'. For multi-round "
             "open-ended exploration of several areas, fan out parallel `agent` calls "
             "with subagent_type='explore'."

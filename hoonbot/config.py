@@ -154,11 +154,20 @@ HEARTBEAT_ACTIVE_END = getattr(_CLUSTER, "HEARTBEAT_ACTIVE_END", "23:59")
 DEBOUNCE_SECONDS = 1.5
 # What happens to a message that arrives while the room's turn is still running
 # — edit in the root cluster_config.py EDIT HERE block:
-#   "queue"     (default) answered in the NEXT turn, in order (⏳ reaction).
+#   "preempt"   (default) after the debounce, STOP the running turn (its tools are
+#               killed, its draft bubble keeps the partial text) and answer the
+#               new message(s) right away together with the interrupted one(s).
+#               A turn that is already writing its answer / delegating to a
+#               cluster node / compacting is never preempted: the message waits
+#               like "queue" (⏳ reaction).
+#   "queue"     answered in the NEXT turn, in order (⏳ reaction).
 #   "interrupt" a follow-up from the SAME sender cancels and merges into the
 #               running turn; other senders still queue.
-FOLLOWUP_POLICY = str(getattr(_CLUSTER, "FOLLOWUP_POLICY", "queue")).strip().lower()
-if FOLLOWUP_POLICY not in {"queue", "interrupt"}:
+FOLLOWUP_POLICY = str(getattr(_CLUSTER, "FOLLOWUP_POLICY", "preempt")).strip().lower()
+if FOLLOWUP_POLICY not in {"preempt", "queue", "interrupt"}:
+    import sys as _sys
+    print(f"[hoonbot config] WARNING: unknown FOLLOWUP_POLICY {FOLLOWUP_POLICY!r} "
+          f"(expected preempt | queue | interrupt) - using 'queue'", file=_sys.stderr)
     FOLLOWUP_POLICY = "queue"
 # Max queued (not yet answered) messages per room; beyond this the oldest
 # pending ones are dropped with a warning.

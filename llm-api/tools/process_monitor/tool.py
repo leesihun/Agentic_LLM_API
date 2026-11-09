@@ -51,6 +51,24 @@ class ManagedProcess:
         default_factory=lambda: {"stdout": None, "stderr": None})
     _group_gone: bool = field(default=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # Observability entry in proc_lifecycle's registry (idle/tail/elapsed).
+    tracker: Any = field(default=None, repr=False)
+
+    def live_info(self, running: bool) -> Dict[str, Any]:
+        """elapsed / idle / tail for status+list (keys are additive)."""
+        info: Dict[str, Any] = {"elapsed_seconds": round(time.time() - self.started_at, 1)}
+        tracker = self.tracker
+        if tracker is not None:
+            try:
+                if running:
+                    info["idle_seconds"] = round(tracker.idle_seconds(), 1)
+                info["output_bytes"] = tracker.output_bytes
+                tail = tracker.tail_text(200)
+                if tail:
+                    info["tail"] = tail
+            except Exception:
+                pass
+        return info
 
     def group_alive(self) -> bool:
         """POSIX: True while any member of the process group (the wrapper's
@@ -101,6 +119,9 @@ def _start_drain_threads(managed: ManagedProcess):
                 break
             if not line:
                 break
+            tracker = managed.tracker
+            if tracker is not None:
+                tracker.note_output(line)   # idle/tail tracking (counts skipped long lines too)
             complete = line.endswith("\n")
             if skipping:
                 if complete:
@@ -314,6 +335,22 @@ class ProcessMonitorTool:
 
         handle = _registry.register(self.session_id, proc, command, str(cwd))
         managed = _registry.get(self.session_id, handle)
+        # Observable registry entry (live UI / supervisor): tagged with the
+        # calling session + tool call; a background job stays registered until
+        # it (and its process group) exits and is NOT killed by a turn stop.
+        ctx_sid = proc_lifecycle.get_call_context()[0]
+        try:
+            managed.tracker = proc_lifecycle.register_process(
+                proc,
+                command=command,
+                tool="process_monitor",
+                cwd=str(cwd),
+                session_id=ctx_sid or self.session_id,
+                kind="popen",
+                background=True,
+            )
+        except Exception:
+            managed.tracker = None
         _start_drain_threads(managed)
 
         return {
@@ -345,6 +382,7 @@ class ProcessMonitorTool:
             "uptime_seconds": round(uptime, 1),
             "total_stdout_lines": managed.total_stdout_lines,
             "total_stderr_lines": managed.total_stderr_lines,
+            **managed.live_info(running),
             **self._orphan_fields(managed, exit_code),
         }
 
@@ -473,6 +511,7 @@ class ProcessMonitorTool:
                 "running": exit_code is None,
                 "exit_code": exit_code,
                 "uptime_seconds": round(time.time() - m.started_at, 1),
+                **m.live_info(exit_code is None),
             }
             if exit_code is not None and m.group_alive():
                 entry["background_children_running"] = True

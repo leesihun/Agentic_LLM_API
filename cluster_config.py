@@ -115,10 +115,13 @@ HEARTBEAT_ACTIVE_END       = "23:59"
 MEMORY_MAX_CHARS           = 12000
 MEMORY_SOFT_CHARS          = 8000
 # FOLLOWUP_POLICY: messages that arrive in a room while the bot is still
-# answering. "queue" = answered next, in order, each kept distinguishable
-# (default). "interrupt" = a follow-up from the SAME sender cancels and merges
-# into the running turn (other senders still queue).
-FOLLOWUP_POLICY            = "queue"
+# answering. "preempt" = stop the running turn right away (tools killed, partial
+# answer kept with a notice) and answer the new message together with the
+# interrupted one (default); a turn already writing its answer / delegating /
+# compacting is not preempted and the message waits instead. "queue" = answered
+# next, in order, each kept distinguishable. "interrupt" = a follow-up from the
+# SAME sender cancels and merges into the running turn (others still queue).
+FOLLOWUP_POLICY            = "preempt"
 # Max conversation transcript (tokens) sent along with a delegated cluster task.
 CLUSTER_DELEGATION_TRANSCRIPT_TOKENS = 32000
 
@@ -282,7 +285,12 @@ MEMORY_MAX_CHARS = max(1000, _int("MEMORY_MAX_CHARS", MEMORY_MAX_CHARS))
 # that memory is condensed on every tick).
 MEMORY_SOFT_CHARS = max(500, min(_int("MEMORY_SOFT_CHARS", MEMORY_SOFT_CHARS), MEMORY_MAX_CHARS))
 FOLLOWUP_POLICY = _env("FOLLOWUP_POLICY", FOLLOWUP_POLICY).lower()
-if FOLLOWUP_POLICY not in {"queue", "interrupt"}:
+if FOLLOWUP_POLICY not in {"preempt", "queue", "interrupt"}:
+    # A typo must not silently select the most disruptive policy (preempt kills
+    # running tools): fall back to the non-destructive "queue" and say so.
+    import sys as _sys
+    print(f"[cluster_config] WARNING: unknown FOLLOWUP_POLICY {FOLLOWUP_POLICY!r} "
+          f"(expected preempt | queue | interrupt) - using 'queue'", file=_sys.stderr)
     FOLLOWUP_POLICY = "queue"
 CLUSTER_DELEGATION_TRANSCRIPT_TOKENS = max(
     1000, _int("CLUSTER_DELEGATION_TRANSCRIPT_TOKENS", CLUSTER_DELEGATION_TRANSCRIPT_TOKENS)

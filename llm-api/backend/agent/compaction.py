@@ -495,7 +495,8 @@ class CompactionMixin:
             role = m.get("role")
             if role == "user":
                 text = _content_text(m).strip()
-                if text:
+                # The loop's own supervisor nudge is not a user request.
+                if text and not text.startswith("Supervisor check after"):
                     user_lines.append(f"- {text[:600]}{'…' if len(text) > 600 else ''}")
             elif role == "assistant":
                 for tc in m.get("tool_calls") or []:

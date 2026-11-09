@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import base64
+import contextvars
 import html
 import locale
 import os
@@ -382,6 +383,7 @@ def track(proc: Any) -> None:
 def untrack(proc: Any) -> None:
     with _live_lock:
         _live.pop(getattr(proc, "pid", None), None)
+    _drop_registry_entry(proc)
 
 
 def _returncode(proc: Any) -> Optional[int]:
@@ -409,6 +411,461 @@ def _kill_all_live() -> None:
 
 
 atexit.register(_kill_all_live)
+
+
+# ======================================================================
+# Call context + observable process registry (K2)
+#
+# The agent's tool dispatcher tags the current call with set_call_context();
+# every process spawned underneath (run_process, process_monitor, grep's rg)
+# registers a TrackedProcess carrying that tag. The registry powers:
+#   - snapshot_processes(): what is actually running for a session / tool call
+#     (pid, command, elapsed, idle, last output) for live UI + the supervisor;
+#   - kill_processes(): stop them right now (user @stop, supervisor verdict).
+# It is separate from `_live` (atexit cleanup), which only needs pid -> proc.
+# ======================================================================
+
+_CALL_CTX: "contextvars.ContextVar[Optional[Tuple[Optional[str], Optional[str], Optional[str]]]]" = (
+    contextvars.ContextVar("proc_lifecycle_call_ctx", default=None)
+)
+
+
+def set_call_context(
+    session_id: Optional[str],
+    tool_call_id: Optional[str],
+    tool_name: Optional[str] = None,
+):
+    """Tag the current execution context (propagates into asyncio tasks and
+    asyncio.to_thread). Returns a Token for reset_call_context()."""
+    return _CALL_CTX.set((session_id, tool_call_id, tool_name))
+
+
+def reset_call_context(token) -> None:
+    """Undo set_call_context(). Never raises (a token minted in another
+    context, e.g. after a task hop, is simply ignored)."""
+    if token is None:
+        return
+    try:
+        _CALL_CTX.reset(token)
+    except (ValueError, RuntimeError, LookupError):
+        pass
+
+
+def get_call_context() -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """(session_id, tool_call_id, tool_name) of the current call, or Nones."""
+    return _CALL_CTX.get() or (None, None, None)
+
+
+# ---- secret masking (command text / output tails shown in the UI) ----------
+
+_SECRET_SUBS: List[Tuple["re.Pattern[str]", str]] = [
+    (re.compile(r"(?i)(authorization\s*[:=]\s*)(?:(?:bearer|basic|token|digest)\s+)?[^\s\"']+"), r"\1***"),
+    (re.compile(
+        r"(?i)(?<![\w-])(--?(?:token|access[-_]?token|auth[-_]?token|api[-_]?key|apikey|secret|"
+        r"client[-_]?secret|password|passwd|pwd|bearer)(?:=|[ \t]+))(\"[^\"]*\"|'[^']*'|\S+)"), r"\1***"),
+    (re.compile(r"(?<![\w-])(-u|--user)([ \t]+|=)(\"[^\"]*:[^\"]*\"|'[^']*:[^']*'|[^\s:]*:\S*)"), r"\1\2***"),
+    (re.compile(
+        r"(?i)\b([A-Za-z0-9_]{0,64}(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIAL)"
+        r"[A-Za-z0-9_]{0,64})([ \t]*=[ \t]*)(\"[^\"]*\"|'[^']*'|\S+)"), r"\1\2***"),
+    # `"api_key": "x"`, `password: x`, `X-Api-Key: x`, `client_secret = x` (JSON / YAML / header forms).
+    # Run lengths are bounded so a long keyword-dense word cannot backtrack quadratically.
+    (re.compile(
+        r"(?i)(\b[\w-]{0,40}(?:token|secret|password|passwd|pwd|api[-_]?key|apikey|access[-_]?key|"
+        r"private[-_]?key|credential)[\w-]{0,40}[\"']?[ \t]*[:=][ \t]*)"
+        r"(\"[^\"]*\"|'[^']*'|[^\s,;}\]\"']+)"), r"\1***"),
+    (re.compile(r"(?i)\b((?:set-)?cookie[ \t]*:[ \t]*)[^\r\n]+"), r"\1***"),
+    # `mysql -uroot -phunter2` (password glued to -p)
+    (re.compile(r"(?i)\b((?:mysql|mariadb|mysqldump|mysqladmin)\w*\b[^\n|;&]{0,300}?[ \t])-p(?=\S)\S+"), r"\1-p***"),
+    (re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^\s/@:]+:[^\s/@]+@"), r"\1***@"),
+    (re.compile(r"(?i)\b(bearer[ \t]+)[A-Za-z0-9._~+/=-]{12,}"), r"\1***"),
+    (re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}"), "***"),
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"), "***"),
+    (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"), "***"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "***"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}"), "***"),
+]
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+_WS_RE = re.compile(r"\s+")
+
+
+def mask_secrets(text: str) -> str:
+    """Best-effort masking of credentials in command text / output (tokens in
+    `--token x`, `Authorization:` headers, `*_TOKEN=...` assignments, URL
+    userinfo, well-known key shapes). Display-only; results fed to the model
+    are never altered."""
+    if not text:
+        return ""
+    for pattern, repl in _SECRET_SUBS:
+        try:
+            text = pattern.sub(repl, text)
+        except Exception:
+            continue
+    return text
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: max(0, limit - 1)] + "…"
+
+
+def _argv_display(argv: Sequence[str]) -> str:
+    """Human-readable command for argv built by shell_argv(): decodes the
+    PowerShell -EncodedCommand payload and unwraps `bash -c <cmd>`."""
+    a = [str(x) for x in argv]
+    try:
+        if "-EncodedCommand" in a:
+            script = base64.b64decode(a[a.index("-EncodedCommand") + 1]).decode("utf-16-le")
+            if script.startswith(_PS_PREFIX):
+                script = script[len(_PS_PREFIX):]
+            if script.endswith(_PS_SUFFIX):
+                script = script[: -len(_PS_SUFFIX)]
+            return script
+        if len(a) >= 3 and a[1] == "-c":
+            return a[2]
+    except Exception:
+        pass
+    return " ".join(a)
+
+
+_DISPLAY_PRE_MASK_CHARS = 2000
+
+
+def _display_command(text: str) -> str:
+    # Clip BEFORE masking: this runs on the event loop and the command can be
+    # ~100 KB; only the first 200 chars are ever shown.
+    collapsed = _WS_RE.sub(" ", (text or "")[:20000]).strip()
+    return _clip(mask_secrets(collapsed[:_DISPLAY_PRE_MASK_CHARS]).strip(), 200)
+
+
+_TAIL_KEEP = 1600   # bytes retained per process (>= 400 chars even for CJK)
+
+
+class TrackedProcess:
+    """Registry entry for one live child process (cheap to update from the
+    output drain: a byte counter, a timestamp and a small tail ring)."""
+
+    __slots__ = (
+        "pid", "proc", "command", "tool", "session_id", "tool_call_id", "cwd",
+        "kind", "background", "started_at", "_started_mono", "_last_output_mono",
+        "output_bytes", "_tail", "stop_reason", "_group_gone", "_lock",
+    )
+
+    def __init__(self, proc: Any, command: str, tool: Optional[str], session_id: Optional[str],
+                 tool_call_id: Optional[str], cwd: Optional[str], kind: str, background: bool):
+        self.pid: int = proc.pid
+        self.proc = proc
+        self.command = command
+        self.tool = tool or "process"
+        self.session_id = session_id
+        self.tool_call_id = tool_call_id
+        self.cwd = cwd
+        self.kind = kind                 # "async" (asyncio Process) | "popen"
+        self.background = background     # survives its tool call (process_monitor, left-running)
+        self.started_at = time.time()
+        self._started_mono = time.monotonic()
+        self._last_output_mono = self._started_mono
+        self.output_bytes = 0
+        self._tail = bytearray()
+        self.stop_reason = ""
+        self._group_gone = False
+        self._lock = threading.Lock()
+
+    # -- updates (any thread) ---------------------------------------------
+    def note_output(self, data: Any) -> None:
+        if not data:
+            return
+        if isinstance(data, str):
+            data = data.encode("utf-8", "replace")
+        now = time.monotonic()
+        with self._lock:
+            self.output_bytes += len(data)
+            self._last_output_mono = now
+            tail = self._tail
+            tail.extend(data[-_TAIL_KEEP:])
+            if len(tail) > 2 * _TAIL_KEEP:
+                del tail[: len(tail) - _TAIL_KEEP]
+
+    # -- queries -----------------------------------------------------------
+    def alive(self) -> bool:
+        """Leader running, or (POSIX) members of its process group still are
+        (a wrapper that exited after backgrounding `server &`). Latched so a
+        recycled pgid is never probed again."""
+        if _returncode(self.proc) is None:
+            return True
+        if IS_WINDOWS or self._group_gone:
+            return False
+        if _group_alive(self.pid):
+            return True
+        self._group_gone = True
+        return False
+
+    def idle_seconds(self) -> float:
+        return max(0.0, time.monotonic() - self._last_output_mono)
+
+    def tail_text(self, limit: int = 400) -> str:
+        with self._lock:
+            raw = bytes(self._tail)   # whole ring (<= 2*_TAIL_KEEP): mask first, slice after
+        if not raw:
+            return ""
+        text = _trim_partial_utf8_tail(raw).decode("utf-8", errors="replace")
+        if _CLIXML_MARK in text:
+            text = _strip_clixml(text)
+        text = _ANSI_RE.sub("", text).replace("\r\n", "\n").replace("\r", "\n")
+        text = mask_secrets(text[-2 * _TAIL_KEEP:]).strip()
+        return text[-limit:] if len(text) > limit else text
+
+    def snapshot(self) -> Dict[str, Any]:
+        now_m = time.monotonic()
+        return {
+            "pid": self.pid,
+            "command": self.command,
+            "tool": self.tool,
+            "session_id": self.session_id,
+            "tool_call_id": self.tool_call_id,
+            "cwd": self.cwd,
+            "started_at": self.started_at,
+            "elapsed": round(now_m - self._started_mono, 1),
+            "idle_seconds": round(max(0.0, now_m - self._last_output_mono), 1),
+            "output_bytes": self.output_bytes,
+            "tail": self.tail_text(400),
+            "alive": self.alive(),
+        }
+
+
+_REG_LOCK = threading.Lock()
+_REG: Dict[int, TrackedProcess] = {}                 # pid -> entry
+_HOOK_LOCK = threading.Lock()
+_HOOKS: Dict[int, Tuple[Optional[str], Optional[str], Any]] = {}   # token -> (session, call, fn)
+_hook_seq = 0
+
+
+def register_process(
+    proc: Any,
+    *,
+    command: str,
+    tool: Optional[str] = None,
+    cwd: Optional[str] = None,
+    session_id: Optional[str] = None,
+    tool_call_id: Optional[str] = None,
+    kind: Optional[str] = None,
+    background: bool = False,
+) -> TrackedProcess:
+    """Add *proc* (asyncio Process or subprocess.Popen) to the observable
+    registry. Missing session/call/tool tags come from the call context."""
+    ctx_sid, ctx_call, ctx_tool = get_call_context()
+    if kind is None:
+        kind = "popen" if isinstance(proc, subprocess.Popen) else "async"
+    entry = TrackedProcess(
+        proc,
+        _display_command(command),
+        tool or ctx_tool,
+        session_id if session_id is not None else ctx_sid,
+        tool_call_id if tool_call_id is not None else ctx_call,
+        cwd,
+        kind,
+        background,
+    )
+    with _REG_LOCK:
+        _REG[entry.pid] = entry
+    return entry
+
+
+def unregister_process(entry: Optional[TrackedProcess]) -> None:
+    if entry is None:
+        return
+    with _REG_LOCK:
+        if _REG.get(entry.pid) is entry:
+            _REG.pop(entry.pid, None)
+
+
+def _drop_registry_entry(proc: Any) -> None:
+    pid = getattr(proc, "pid", None)
+    if pid is None:
+        return
+    with _REG_LOCK:
+        entry = _REG.get(pid)
+        if entry is not None and entry.proc is proc:
+            _REG.pop(pid, None)
+
+
+def _session_matches(entry_sid: Optional[str], sid: Optional[str], include_children: bool) -> bool:
+    if sid is None:
+        return True
+    if not entry_sid:
+        return False
+    if entry_sid == sid:
+        return True
+    return bool(include_children and entry_sid.startswith(sid + "__sub_"))
+
+
+def _matching(session_id: Optional[str], tool_call_id: Optional[str],
+              include_children_sessions: bool) -> List[TrackedProcess]:
+    with _REG_LOCK:
+        entries = list(_REG.values())
+    out = []
+    for e in entries:
+        if tool_call_id is not None and e.tool_call_id != tool_call_id:
+            continue
+        if not _session_matches(e.session_id, session_id, include_children_sessions):
+            continue
+        out.append(e)
+    return out
+
+
+def _prune_dead_entry(entry: TrackedProcess) -> None:
+    """Drop an entry whose leader AND process group are gone (alive() already
+    latched it), so a never-polled process_monitor job cannot linger and later
+    alias a recycled pid in kill/atexit paths."""
+    try:
+        with _REG_LOCK:
+            if _REG.get(entry.pid) is entry:
+                _REG.pop(entry.pid, None)
+        with _live_lock:
+            if _live.get(entry.pid) is entry.proc:
+                _live.pop(entry.pid, None)
+    except Exception:
+        pass
+
+
+def snapshot_processes(
+    session_id: Optional[str] = None,
+    tool_call_id: Optional[str] = None,
+    include_children_sessions: bool = True,
+) -> List[Dict[str, Any]]:
+    """Live registered processes (run_process + process_monitor background
+    procs), oldest first. session_id also matches child sessions
+    `<sid>__sub_*` when include_children_sessions. Never raises."""
+    try:
+        snaps = []
+        for e in sorted(_matching(session_id, tool_call_id, include_children_sessions),
+                        key=lambda x: x.started_at):
+            try:
+                if e.alive():
+                    snaps.append(e.snapshot())
+                else:
+                    _prune_dead_entry(e)
+            except Exception:
+                continue
+        return snaps
+    except Exception:
+        return []
+
+
+def register_cancel_hook(fn: Any) -> int:
+    """Register a zero-arg callable that kill_processes() invokes for the
+    current call (session / tool_call_id from the call context). Used by
+    thread-based tools (file_navigator, grep, ...) to stop cooperatively when
+    the user stops the turn or the supervisor cancels the call."""
+    global _hook_seq
+    sid, call_id, _ = get_call_context()
+    with _HOOK_LOCK:
+        _hook_seq += 1
+        token = _hook_seq
+        _HOOKS[token] = (sid, call_id, fn)
+    return token
+
+
+def unregister_cancel_hook(token: Optional[int]) -> None:
+    if token is None:
+        return
+    with _HOOK_LOCK:
+        _HOOKS.pop(token, None)
+
+
+def _fire_cancel_hooks(session_id: Optional[str], tool_call_id: Optional[str],
+                       include_children_sessions: bool) -> None:
+    with _HOOK_LOCK:
+        hooks = list(_HOOKS.values())
+    for sid, call_id, fn in hooks:
+        if tool_call_id is not None and call_id != tool_call_id:
+            continue
+        if not _session_matches(sid, session_id, include_children_sessions):
+            continue
+        try:
+            fn()
+        except Exception:
+            pass
+
+
+def _kill_entry_blocking(entry: TrackedProcess, term_grace: float = 1.0,
+                         wait_grace: float = 3.0) -> None:
+    """Kill the whole tree of *entry* by pid (worker-thread safe; works for
+    asyncio Process and Popen alike). SIGTERM -> grace -> SIGKILL."""
+    pid = entry.pid
+    try:
+        if IS_WINDOWS:
+            if _returncode(entry.proc) is None:
+                _taskkill(pid)
+            deadline = time.monotonic() + wait_grace
+            while _returncode(entry.proc) is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if _returncode(entry.proc) is None:
+                try:
+                    os.kill(pid, signal.SIGTERM)   # TerminateProcess
+                except Exception:
+                    pass
+            return
+        if not _signal_group(pid, signal.SIGTERM) and _returncode(entry.proc) is None:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except Exception:
+                pass
+        deadline = time.monotonic() + term_grace
+        while time.monotonic() < deadline:
+            if _returncode(entry.proc) is not None and not _group_alive(pid):
+                break
+            time.sleep(0.05)
+        if _group_alive(pid):
+            _signal_group(pid, signal.SIGKILL)
+        if _returncode(entry.proc) is None:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+async def kill_processes(
+    session_id: Optional[str] = None,
+    tool_call_id: Optional[str] = None,
+    reason: str = "",
+    include_children_sessions: bool = True,
+    include_background: bool = False,
+) -> int:
+    """Kill the process TREE of every live registered process matching the
+    filters and return how many were targeted. The awaiting run_process
+    returns promptly with `stopped=True` / `stop_reason=<reason>` and the
+    partial output captured so far. Also fires cooperative cancel hooks of
+    thread-based tools for the same session / call.
+
+    include_background (deviation from K2, additive, default False):
+    process_monitor background jobs and left-running shell jobs are meant to
+    outlive a turn, so a user stop / supervisor verdict leaves them alone
+    unless the caller opts in. Safe to call with nothing running."""
+    why = (reason or "stopped").strip() or "stopped"
+    try:
+        _fire_cancel_hooks(session_id, tool_call_id, include_children_sessions)
+    except Exception:
+        pass
+    targets = []
+    for e in _matching(session_id, tool_call_id, include_children_sessions):
+        if e.background and not include_background:
+            continue
+        try:
+            if not e.alive():
+                continue
+        except Exception:
+            continue
+        if not e.stop_reason:
+            e.stop_reason = why
+        targets.append(e)
+    if not targets:
+        return 0
+    await asyncio.gather(
+        *(asyncio.to_thread(_kill_entry_blocking, e) for e in targets),
+        return_exceptions=True,
+    )
+    return len(targets)
 
 
 # ======================================================================
@@ -604,10 +1061,13 @@ class ProcResult:
     drain_incomplete: bool = False       # stopped reading: a background child held the pipe
     duration: float = 0.0
     notes: List[str] = field(default_factory=list)
+    stopped: bool = False                # killed via kill_processes() (user stop / supervisor)
+    stop_reason: str = ""
 
 
 async def _drain(stream: Optional[asyncio.StreamReader], buf: HeadTailBuffer,
-                 last_seen: Optional[list] = None) -> None:
+                 last_seen: Optional[list] = None,
+                 entry: Optional[TrackedProcess] = None) -> None:
     if stream is None:
         return
     while True:
@@ -615,6 +1075,8 @@ async def _drain(stream: Optional[asyncio.StreamReader], buf: HeadTailBuffer,
         if not chunk:
             return
         buf.feed(chunk)
+        if entry is not None:
+            entry.note_output(chunk)
         if last_seen is not None:
             last_seen[0] = asyncio.get_running_loop().time()
 
@@ -649,7 +1111,8 @@ def _spawn_bg(coro) -> None:
 
 
 async def _reap_left_running(proc, drains: Sequence[asyncio.Task],
-                             wait_task: asyncio.Task) -> None:
+                             wait_task: asyncio.Task,
+                             entry: Optional[TrackedProcess] = None) -> None:
     """kill_on_timeout=False: the drains keep consuming output after
     run_process returns; once the child exits, finish the drains (bounded —
     closes the pipes if a background grandchild still holds them) and untrack."""
@@ -666,6 +1129,7 @@ async def _reap_left_running(proc, drains: Sequence[asyncio.Task],
     finally:
         if proc.returncode is not None:
             untrack(proc)
+            unregister_process(entry)
 
 
 async def run_process(
@@ -680,6 +1144,8 @@ async def run_process(
     tail_bytes: int = DEFAULT_TAIL_BYTES,
     drain_grace: float = DRAIN_GRACE_SECONDS,
     clixml_stderr: bool = False,
+    display_command: Optional[str] = None,
+    tool: Optional[str] = None,
 ) -> ProcResult:
     """Run *argv* with the hardened lifecycle described in the module docstring.
 
@@ -687,6 +1153,9 @@ async def run_process(
     idle_timeout: kill when no stdout/stderr bytes arrive for this long.
     kill_on_timeout=False: on timeout leave the process running (legacy
     SHELL_EXEC_KILL_ON_TIMEOUT=False) and return what was captured so far.
+    display_command / tool: what the live registry (snapshot_processes) shows
+    for this process; default is derived from argv and the call context.
+    If kill_processes() stops it, the result has stopped=True / stop_reason.
     Raises whatever create_subprocess_exec raises (e.g. FileNotFoundError).
     """
     start = time.monotonic()
@@ -700,13 +1169,20 @@ async def run_process(
         **spawn_kwargs(),
     )
     track(proc)
+    entry = register_process(
+        proc,
+        command=display_command if display_command is not None else _argv_display(argv),
+        tool=tool,
+        cwd=cwd,
+        kind="async",
+    )
 
     loop = asyncio.get_running_loop()
     out_buf = HeadTailBuffer(head_bytes, tail_bytes)
     err_buf = HeadTailBuffer(head_bytes, tail_bytes)
     last_seen = [loop.time()]
-    out_task = asyncio.create_task(_drain(proc.stdout, out_buf, last_seen))
-    err_task = asyncio.create_task(_drain(proc.stderr, err_buf, last_seen))
+    out_task = asyncio.create_task(_drain(proc.stdout, out_buf, last_seen, entry))
+    err_task = asyncio.create_task(_drain(proc.stderr, err_buf, last_seen, entry))
     wait_task = asyncio.create_task(proc.wait())
 
     timed_out = False
@@ -719,7 +1195,7 @@ async def run_process(
         if timeout is not None and timeout > 0:
             deadline = loop.time() + float(timeout)
         while True:
-            step = 1.0
+            step = 0.25 if entry.stop_reason else 1.0
             if deadline is not None:
                 step = max(0.05, min(step, deadline - loop.time()))
             done, _ = await asyncio.wait({wait_task}, timeout=step)
@@ -743,7 +1219,8 @@ async def run_process(
             # blocks on a full pipe. A background reaper closes the pipes and
             # untracks it once it exits.
             leave_running = True
-            _spawn_bg(_reap_left_running(proc, (out_task, err_task), wait_task))
+            entry.background = True   # outlives this call: not killed by a turn stop
+            _spawn_bg(_reap_left_running(proc, (out_task, err_task), wait_task, entry))
         else:
             if timed_out:
                 await kill_tree(proc)
@@ -761,9 +1238,12 @@ async def run_process(
             for t in (out_task, err_task, wait_task):
                 if not t.done():
                     t.cancel()
-        if proc.returncode is not None and not leave_running:
-            untrack(proc)
+        if not leave_running:
+            if proc.returncode is not None:
+                untrack(proc)
+            unregister_process(entry)
 
+    stop_reason = entry.stop_reason
     stdout = out_buf.text()
     stderr = err_buf.text(clixml=clixml_stderr)
     if clixml_stderr and IS_WINDOWS:
@@ -772,6 +1252,8 @@ async def run_process(
         notes.append(f"stdout: {out_buf.omitted:,} bytes omitted from the middle (head+tail kept)")
     if err_buf.omitted:
         notes.append(f"stderr: {err_buf.omitted:,} bytes omitted from the middle (head+tail kept)")
+    if stop_reason:
+        notes.append(f"stopped: {stop_reason} (process tree killed; output above is partial)")
     rc = proc.returncode
     return ProcResult(
         stdout=stdout,
@@ -786,6 +1268,8 @@ async def run_process(
         drain_incomplete=BACKGROUND_PIPE_NOTE in notes,
         duration=time.monotonic() - start,
         notes=notes,
+        stopped=bool(stop_reason),
+        stop_reason=stop_reason,
     )
 
 

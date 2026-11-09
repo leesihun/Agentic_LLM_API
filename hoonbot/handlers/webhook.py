@@ -11,10 +11,16 @@ Rapid-input model (per room, see RoomState):
     then the worker takes ALL queued chat messages (<= BATCH_MAX_MESSAGES) as
     ONE turn. Multiple messages are sent to the LLM as labelled <message>
     blocks so each one is answered separately instead of being mixed up.
-  - Messages that arrive while a turn runs wait for the NEXT turn (⏳ reaction
-    while waiting). FOLLOWUP_POLICY="interrupt" restores the old cancel+merge
-    behaviour for same-sender follow-ups only.
-  - @stop / @clear run immediately, outside the queue. @compact and /goal are
+  - FOLLOWUP_POLICY decides what a message that arrives while a turn runs does:
+    "preempt" (default) stops the running turn once the debounce window has
+    collected the burst (server-side tools killed, draft bubble settled with
+    the partial text + a notice, session reused) and starts a new turn at once
+    whose batch ALSO carries the interrupted message(s), flagged as such;
+    a turn that is already finalizing / delegating / compacting is not
+    preempted — the message waits (⏳ reaction) like under "queue" (wait for
+    the NEXT turn). "interrupt" cancels+merges for same-sender follow-ups only.
+  - @stop / @clear / @status run immediately, outside the queue (@status only
+    reports; it never cancels or preempts). @compact and /goal are
     handled in order inside the queue, as is a catch-up-replayed @clear (so it
     cannot jump ahead of replayed messages sent before it).
   - Catch-up replay (process_message) and external webhooks go through the
@@ -555,6 +561,15 @@ class _QueuedMessage:
     # Names this message's attachments were uploaded to the LLM API under
     # (unique within the turn; set by _process_turn).
     upload_names: list = field(default_factory=list)
+    # True once a running turn working on this message was preempted by a newer
+    # message: the next turn flags it so the model does not repeat finished work.
+    interrupted: bool = False
+    # How many times a running turn carrying this message was preempted; capped
+    # (_PREEMPT_MAX_PER_BATCH) so a chatty room cannot starve a request forever.
+    preempts: int = 0
+    # Set when the message is deleted while its turn is in flight, so a preempt
+    # re-queue does not resurrect it.
+    deleted: bool = False
 
 
 class _TurnContext:
@@ -564,13 +579,29 @@ class _TurnContext:
         self.batch = batch
         self.generation = generation
         self.epoch = epoch
-        self.cancel_reason: str | None = None     # "stop" | "interrupt" | "shutdown"
+        self.cancel_reason: str | None = None     # "stop" | "interrupt" | "preempt" | "shutdown"
         # True once the final answer is being written — too late to interrupt
         # (re-queueing would answer the same batch twice).
         self.finalized = False
         # True while a cluster delegation is being submitted — not
         # interruptible (a re-queue could submit the same task twice).
         self.delegating = False
+        # True once the batch is handed to the LLM pipeline (after the cluster
+        # delegation pass). Only a "working" turn is preemptable.
+        self.working = False
+        self.started_at = time.monotonic()
+        # Only messages that arrived AFTER this turn started may preempt it
+        # (overflow left in the queue by _take_batch must not).
+        self.start_seq = _seq_counter
+        # True once the request was sent to llm-api (the server may hold the
+        # interrupted partial turn in the session history).
+        self.posted = False
+        # True once llm-api accepted the request (response headers / first
+        # event): the user turn is then persisted in the session history.
+        self.accepted = False
+        # (session_id, epoch) of a condensed-memory re-send carried by this
+        # attempt, cleared from the session entry as soon as it is accepted.
+        self.memory_refresh_pending: tuple | None = None
         self.session_id: str | None = None
         self.memory_fp: str | None = None
         self.memory_chars: int | None = None
@@ -607,6 +638,9 @@ class RoomState:
         self.last_arrival = 0.0
         self.last_accepted: tuple | None = None   # (sender, monotonic) for continuation window
         self.queue_full_notified = False
+        # Set by _enqueue so the worker, while it waits on a running turn, can
+        # re-evaluate whether the newly queued message should preempt it.
+        self.wake = asyncio.Event()
 
     @property
     def pending(self) -> int:
@@ -858,7 +892,9 @@ _load_room_queue()
 
 
 def _followup_policy() -> str:
-    return str(getattr(config, "FOLLOWUP_POLICY", "queue") or "queue").strip().lower()
+    value = str(getattr(config, "FOLLOWUP_POLICY", "preempt") or "preempt").strip().lower()
+    # Unknown values (typos) get the non-destructive policy, never the aggressive one.
+    return value if value in {"preempt", "queue", "interrupt"} else "queue"
 
 
 def _batch_max() -> int:
@@ -905,6 +941,7 @@ def _enqueue(state: RoomState, item: _QueuedMessage) -> bool:
 
     state.queue.append(item)
     state.last_arrival = time.monotonic()
+    state.wake.set()  # lets the worker re-check a "preempt" while it awaits a turn
     if _shutting_down:
         # No new turns during shutdown — persist it for the next run instead.
         logger.info(f"[Queue] Room {state.key}: message {item.msg_id} kept for the next run (shutting down)")
@@ -925,6 +962,153 @@ def _ensure_worker(state: RoomState) -> None:
         return
     if state.task is None or state.task.done():
         state.task = asyncio.create_task(_room_worker(state))
+
+
+# ---------------------------------------------------------------------------
+# "preempt" follow-up policy
+# ---------------------------------------------------------------------------
+
+# Max time to wait for a preempted turn's task to finish cancelling (its draft
+# bubble is settled with the partial text during that time).
+_PREEMPT_CANCEL_WAIT_SECONDS = 10.0
+# Max time to wait for llm-api to release the session's turn lease after the
+# preempted turn was stopped, before the new turn is sent (it would otherwise
+# get a 409 "session busy" and burn its retry budget).
+_PREEMPT_IDLE_WAIT_SECONDS = 8.0
+# While a queued message is blocked from preempting (turn finalizing /
+# delegating), re-check this often.
+_PREEMPT_RECHECK_SECONDS = 1.0
+# A message carried by a turn that was already preempted this many times is not
+# preempted again: the turn runs to completion and newer messages queue behind it
+# (otherwise a chatty room starves the request and keeps killing its tools).
+_PREEMPT_MAX_PER_BATCH = 3
+
+
+def _turn_preemptable(state: RoomState, ctx: _TurnContext | None) -> bool:
+    """A turn may be preempted only while it is still working on chat messages:
+    not finalizing/delivering the answer, not submitting a cluster delegation,
+    not already being cancelled, not an in-queue directive (@compact, ...)."""
+    return (
+        ctx is not None
+        and not state.external
+        and ctx.working
+        and ctx.cancel_reason is None
+        and not ctx.finalized
+        and not ctx.delegating
+        and bool(ctx.batch)
+        and all(m.kind == "chat" for m in ctx.batch)
+        and max((m.preempts for m in ctx.batch), default=0) < _PREEMPT_MAX_PER_BATCH
+    )
+
+
+def _preempt_due_in(state: RoomState, ctx: _TurnContext | None = None) -> float | None:
+    """Seconds until the queued burst has been quiet for DEBOUNCE_SECONDS (<= 0:
+    due now), or None when the policy / queue does not call for a preempt.
+
+    Only a queue whose head is a chat message preempts — a directive at the
+    head (@compact, /goal, a queued @clear) must keep its order, so it waits.
+    Only messages that arrived after the running turn started count: overflow
+    that _take_batch left in the queue (more than BATCH_MAX_MESSAGES) was already
+    waiting and must not preempt the turn that is working on its predecessors.
+    """
+    if _shutting_down or state.external or _followup_policy() != "preempt":
+        return None
+    if not state.queue or state.queue[0].kind != "chat":
+        return None
+    if ctx is not None and not any(m.kind == "chat" and m.seq > ctx.start_seq for m in state.queue):
+        return None
+    return state.last_arrival + float(config.DEBOUNCE_SECONDS) - time.monotonic()
+
+
+async def _remote_stop(session_id: str | None) -> bool:
+    """Ask llm-api to stop *session_id* (kills its tools, frees the lease)."""
+    if not session_id:
+        return False
+    fn = getattr(llm_api, "stop_session", None)
+    try:
+        if callable(fn):
+            return bool(await fn(session_id))
+        await _post_session_action(session_id, "stop", timeout=10.0)
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(f"[Queue] Stop request for session {session_id} failed: {exc}")
+        return False
+
+
+async def _wait_session_idle(session_id: str | None, timeout: float = _PREEMPT_IDLE_WAIT_SECONDS) -> None:
+    """Poll llm-api until the session's turn lease is released (bounded, best
+    effort). Returns at once when the activity endpoint is unavailable."""
+    fn = getattr(llm_api, "get_activity", None)
+    if not session_id or not callable(fn):
+        return
+
+    async def _poll() -> None:
+        while True:
+            activity = await fn(session_id)
+            if not isinstance(activity, dict) or not activity.get("busy"):
+                return
+            await asyncio.sleep(0.4)
+
+    try:
+        await asyncio.wait_for(_poll(), timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning(f"[Queue] Session {session_id} still busy {timeout:.0f}s after preempt — sending the new turn anyway")
+
+
+async def _preempt_turn(state: RoomState, ctx: _TurnContext, turn: asyncio.Task) -> None:
+    """Cancel the room's running turn so the queued newer message(s) run now.
+
+    The turn task settles its draft bubble itself (shielded, see
+    _finalize_cancelled) with a preempt notice; the worker re-queues its batch
+    (flagged `interrupted`) once the task is done. Runs on the worker task.
+    """
+    ctx.cancel_reason = "preempt"
+    session_id = ctx.session_id or _peek_session_id(state.key)
+    newer = sum(1 for m in state.queue if m.kind == "chat")
+    logger.info(f"[Queue] Room {state.key}: preempting running turn ({len(ctx.batch)} message(s), "
+                f"session={session_id}) for {newer} newer message(s)")
+    turn.cancel()
+    stop_task = _spawn(_remote_stop(session_id)) if session_id else None
+    deadline = time.monotonic() + _PREEMPT_CANCEL_WAIT_SECONDS
+    await asyncio.wait({turn}, timeout=_PREEMPT_CANCEL_WAIT_SECONDS)
+    if not turn.done():
+        logger.warning(f"[Queue] Room {state.key}: preempted turn still cancelling after "
+                       f"{_PREEMPT_CANCEL_WAIT_SECONDS:.0f}s — waiting for it in the background")
+    if stop_task is not None and not stop_task.done():
+        await asyncio.wait({stop_task}, timeout=max(0.5, deadline - time.monotonic()))
+
+
+async def _await_turn(state: RoomState, ctx: _TurnContext, turn: asyncio.Task) -> None:
+    """Wait for *turn* to end, preempting it when FOLLOWUP_POLICY allows.
+
+    asyncio.wait never raises when the *turn* is cancelled (@stop); only a
+    cancellation of the worker itself propagates.
+    """
+    while not turn.done():
+        preempt_mode = _followup_policy() == "preempt" and not state.external
+        state.wake.clear()
+        timeout = None
+        if preempt_mode and ctx.cancel_reason is None and not ctx.finalized:
+            due_in = _preempt_due_in(state, ctx)
+            if due_in is not None:
+                timeout = max(0.05, due_in) if due_in > 0 else _PREEMPT_RECHECK_SECONDS
+        waiters: set = {turn}
+        wake_fut = None
+        if preempt_mode:
+            wake_fut = asyncio.ensure_future(state.wake.wait())
+            waiters.add(wake_fut)
+        try:
+            await asyncio.wait(waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            if wake_fut is not None:
+                wake_fut.cancel()
+        if turn.done():
+            return
+        due_in = _preempt_due_in(state, ctx)
+        if due_in is not None and due_in <= 0 and _turn_preemptable(state, ctx):
+            await _preempt_turn(state, ctx, turn)
 
 
 def _take_batch(state: RoomState) -> list:
@@ -962,9 +1146,7 @@ async def _room_worker(state: RoomState) -> None:
             state.turn_task = turn
             state.turn_ctx = ctx
             try:
-                # asyncio.wait never raises when the *turn* is cancelled (@stop);
-                # only a cancellation of the worker itself propagates here.
-                await asyncio.wait({turn})
+                await _await_turn(state, ctx, turn)
             except asyncio.CancelledError:
                 turn.cancel()
                 # Worker cancelled (shutdown): the batch stays persisted for
@@ -979,12 +1161,28 @@ async def _room_worker(state: RoomState) -> None:
 
             if not turn.cancelled() and turn.exception() is not None:
                 logger.error(f"[Queue] Room {state.key}: turn crashed: {turn.exception()!r}")
-            if ctx.cancel_reason == "interrupt" and not ctx.finalized:
-                state.queue.extendleft(reversed([m for m in ctx.batch if m.kind == "chat"]))
+            if ctx.cancel_reason in ("interrupt", "preempt") and not ctx.finalized:
+                # Re-queue the interrupted messages ahead of the newer ones (the
+                # queue file keeps them until a turn that includes them ends).
+                # Messages deleted while their turn was running stay deleted.
+                requeue = [m for m in ctx.batch if m.kind == "chat" and not m.deleted]
+                if ctx.cancel_reason == "preempt":
+                    # Only claim "partial work is in the session history" when
+                    # the request actually reached llm-api under a known session.
+                    reached = ctx.posted and bool(ctx.session_id or _peek_session_id(state.key))
+                    for m in requeue:
+                        m.preempts += 1
+                        if reached:
+                            m.interrupted = True
+                state.queue.extendleft(reversed(requeue))
             if state.inflight_ctx is ctx and not (ctx.cancel_reason == "shutdown" and not ctx.finalized):
                 state.inflight_ctx = None
             if not state.external:
                 _schedule_queue_save()
+            if ctx.cancel_reason == "preempt" and not ctx.finalized:
+                # The server must release the session's turn lease before the
+                # next turn on the same session can start (else 409).
+                await _wait_session_idle(ctx.session_id or _peek_session_id(state.key))
     finally:
         if state.task is me:
             state.task = None
@@ -1005,7 +1203,7 @@ def _strip_mention(content: str) -> str:
 
 
 def _classify(content: str) -> tuple:
-    """Return (kind, cleaned_content). kind: stop | clear | compact | goal | chat.
+    """Return (kind, cleaned_content). kind: stop | status | clear | compact | goal | chat.
 
     Mentions are stripped the same way in every room (home included) and the
     directive is the LEADING token only — "@stop" in the middle of a sentence
@@ -1017,6 +1215,12 @@ def _classify(content: str) -> tuple:
     tok = m.group(1).lower() if m else ""
     if tok == "@stop":
         return "stop", lead
+    if tok in ("@status", "/status"):
+        # A bare directive only ("@status", "/status?"), so ordinary text that
+        # merely starts with "/status ..." or a path like "/status/x" stays chat.
+        rest = lead[m.end():]
+        if not rest or (rest[0] in " \t\r\n,:;!?" and len(rest.strip()) <= 12):
+            return "status", lead
     if tok == "@clear":
         return "clear", lead
     if tok == "@compact":
@@ -1073,6 +1277,12 @@ def _ingest_message(room_id: int, content: str, sender_name: str, msg_id: int | 
             return "ignored"
         _spawn(_handle_stop(state, sender_name))
         return "stop"
+    if kind == "status":
+        if source == "catchup":
+            logger.info(f"{log_prefix} Ignoring replayed @status")
+            return "ignored"
+        _spawn(_handle_status(state, sender_name, msg_id))
+        return "status"
     if kind == "clear" and source != "catchup" and not state.queue:
         _handle_clear(state, sender_name)
         return "clear"
@@ -1248,8 +1458,26 @@ def _find_queued(room_id, msg_id):
     return state, None
 
 
+def _find_inflight(room_id, msg_id):
+    """The message of the room's running (or just-preempted) turn, if any."""
+    state = _rooms.get(room_id)
+    if state is None or msg_id is None:
+        return None
+    for ctx in (state.turn_ctx, state.inflight_ctx):
+        if ctx is None:
+            continue
+        for item in ctx.batch:
+            if item.msg_id == msg_id:
+                return item
+    return None
+
+
 def _update_queued(room_id, msg_id, new_content) -> None:
     state, item = _find_queued(room_id, msg_id)
+    if item is None:
+        # In-flight message: the running turn keeps its old text, but a preempt
+        # re-queue must carry the edited text.
+        item = _find_inflight(room_id, msg_id)
     if item is None or item.kind != "chat" or not isinstance(new_content, str):
         return
     kind, clean = _classify(new_content.strip())
@@ -1262,6 +1490,10 @@ def _update_queued(room_id, msg_id, new_content) -> None:
 def _remove_queued(room_id, msg_id) -> None:
     state, item = _find_queued(room_id, msg_id)
     if item is None:
+        inflight = _find_inflight(room_id, msg_id)
+        if inflight is not None:
+            inflight.deleted = True
+            logger.info(f"[Queue] Room {room_id}: in-flight message {msg_id} deleted (not re-queued on preempt)")
         return
     try:
         state.queue.remove(item)
@@ -1430,6 +1662,123 @@ async def _handle_stop(state: RoomState, sender_name: str) -> None:
     logger.info(f"{log_prefix} Stopped by @stop command (dropped {dropped} queued)")
 
 
+_STATUS_MAX_TOOLS = 5
+_STATUS_MAX_PROCESSES = 4
+
+
+def _build_status_text(state: RoomState, activity: dict | None) -> str:
+    """Compact, plain-text status of a room: turn phase and age, queue length,
+    and the server-side activity snapshot (running tools, live processes).
+
+    Pure (no I/O): *activity* is llm_api.get_activity()'s dict or None. Reads
+    only loop-owned state, so it is safe to call from any coroutine."""
+    ctx = state.turn_ctx
+    running = state.busy and ctx is not None
+    lines = ["📊 **상태**"]
+    if running:
+        age = _fmt_duration(time.monotonic() - ctx.started_at)
+        if ctx.finalized:
+            phase = "답변 정리 중"
+        elif ctx.delegating:
+            phase = "클러스터 작업 위임 중"
+        elif ctx.working:
+            phase = "작업 중"
+        else:
+            phase = "준비 중"
+        lines.append(f"• 진행 중인 요청: 있음 — {phase} ({age}째, 메시지 {len(ctx.batch)}개)")
+    else:
+        lines.append("• 진행 중인 요청: 없음")
+    queued = len(state.queue)
+    lines.append(f"• 대기 중인 메시지: {queued}개" if queued else "• 대기 중인 메시지: 없음")
+    if _room_goal_mode.get(state.key):
+        lines.append("• 모드: goal (/goal off 로 해제)")
+
+    session_id = (ctx.session_id if ctx is not None else None) or _peek_session_id(state.key)
+    if not isinstance(activity, dict):
+        lines.append("• 서버 상태: 확인할 수 없음 (LLM API 응답 없음)" if session_id else "• 서버 세션: 아직 없음")
+        return "\n".join(lines)
+
+    turn = activity.get("turn") if isinstance(activity.get("turn"), dict) else None
+    if turn:
+        bits = []
+        if turn.get("started_elapsed") is not None:
+            bits.append(f"{_fmt_duration(turn.get('started_elapsed'))}째")
+        if turn.get("iteration") is not None:
+            bits.append(f"반복 {turn.get('iteration')}회")
+        if turn.get("state"):
+            bits.append(_one_line(turn.get("state"), 30))
+        idle = turn.get("idle_seconds")
+        if idle is not None and _as_float(idle, -1.0) >= _PROCESS_IDLE_SHOW_SECONDS:
+            bits.append(f"마지막 활동 {_fmt_duration(idle)} 전")
+        if bits:
+            lines.append("• 서버: " + " · ".join(bits))
+    elif activity.get("busy"):
+        lines.append("• 서버: 세션 사용 중")
+    if activity.get("stop_pending"):
+        lines.append("• 중지 요청 처리 중")
+
+    tools = [t for t in (activity.get("tools") or []) if isinstance(t, dict)]
+    shown_pids: set = set()
+    if tools:
+        lines.append("🔧 **실행 중인 도구**")
+        for t in tools[:_STATUS_MAX_TOOLS]:
+            line = f"⏳ {t.get('tool_name') or '?'}"
+            detail = _one_line(t.get("detail"), 80)
+            if detail:
+                line += f" — {detail}"
+            line += f" · {_fmt_duration(t.get('elapsed'))}"
+            lines.append(line)
+            for proc in [p for p in (t.get("processes") or []) if isinstance(p, dict)][:_PROCESS_LINES_PER_TOOL]:
+                shown_pids.add(proc.get("pid"))
+                lines.append(_process_line(proc))
+        if len(tools) > _STATUS_MAX_TOOLS:
+            lines.append(f"… 외 {len(tools) - _STATUS_MAX_TOOLS}개")
+    others = [p for p in (activity.get("processes") or [])
+              if isinstance(p, dict) and p.get("pid") not in shown_pids]
+    if others:
+        lines.append("⚙️ **실행 중인 프로세스**")
+        for proc in others[:_STATUS_MAX_PROCESSES]:
+            lines.append(_process_line(proc, indent=""))
+        if len(others) > _STATUS_MAX_PROCESSES:
+            lines.append(f"… 외 {len(others) - _STATUS_MAX_PROCESSES}개")
+    if not tools and not others and (running or activity.get("busy")):
+        lines.append("• 지금 실행 중인 도구/프로세스는 없어요 (모델이 생각하거나 답을 쓰는 중)")
+    return "\n".join(lines)
+
+
+async def _handle_status(state: RoomState, sender_name: str, msg_id=None) -> None:
+    """@status — report what the room is doing right now.
+
+    Runs outside the room queue like @stop but is strictly read-only: it never
+    preempts, cancels or enqueues anything, and a failure here is only logged.
+    """
+    log_prefix = f"[Room {state.key}] [{sender_name}]"
+    try:
+        session_id = (state.turn_ctx.session_id if state.turn_ctx is not None else None) or _peek_session_id(state.key)
+        activity = None
+        if session_id:
+            try:
+                activity = await llm_api.get_activity(session_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug(f"{log_prefix} get_activity failed: {exc}")
+        text = _build_status_text(state, activity)
+        # Other (external webhook) sessions streaming into this room.
+        if not state.external:
+            busy_ext = [o for o in list(_rooms.values())
+                        if o is not state and o.external and str(o.room_id) == str(state.room_id) and o.busy]
+            for other in busy_ext[:3]:
+                text += f"\n• 외부 웹훅 작업 진행 중: {other.key}"
+        reply_to = msg_id if isinstance(msg_id, int) else None
+        await messenger.send_message(state.room_id, text, reply_to_id=reply_to)
+        logger.info(f"{log_prefix} Reported status via @status")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(f"{log_prefix} @status failed: {exc}")
+
+
 def _handle_clear(state: RoomState, sender_name: str) -> None:
     """@clear — wipe the room session immediately (outside the queue)."""
     state.generation += 1  # an in-flight turn must not re-save its session
@@ -1554,6 +1903,9 @@ async def _run_batch(state: RoomState, ctx: _TurnContext) -> None:
             if not ctx.batch:
                 return
 
+        # From here on the turn is "working": a newer message may preempt it
+        # (FOLLOWUP_POLICY="preempt") until the final answer starts being written.
+        ctx.working = True
         await _process_turn(state, ctx)
     except asyncio.CancelledError:
         raise
@@ -1566,6 +1918,12 @@ async def _run_batch(state: RoomState, ctx: _TurnContext) -> None:
 # ---------------------------------------------------------------------------
 
 _BATCH_INTRO = "다음은 짧은 시간에 들어온 {n}개의 메시지입니다. 각각을 구분해서 모두 답하세요 (메시지 id/보낸 사람 표시)."
+# Added to a batch that carries message(s) whose earlier turn was preempted by a
+# newer message (FOLLOWUP_POLICY="preempt"); the llm-api session history already
+# holds that interrupted partial turn (marked [interrupted], with its tool ledger).
+_INTERRUPTED_STATUS = "interrupted-earlier-request"
+_INTERRUPTED_NOTE = ("아래 앞선 요청은 처리 중 새 메시지 때문에 중단되었습니다. "
+                     "이미 한 작업은 반복하지 말고, 앞선 요청과 새 요청을 모두 고려해 답하세요.")
 _REPLY_QUOTE_MAX_CHARS = 1000
 _REPLY_QUOTE_MAX_CHARS_BOT = 4000
 
@@ -1635,6 +1993,8 @@ def _format_message_block(m: _QueuedMessage) -> str:
     if m.upload_names:
         # Exact uploaded file names, so each file can be tied to its message.
         attrs.append(f'attachments="{_attr(", ".join(m.upload_names))}"')
+    if m.interrupted:
+        attrs.append(f'status="{_INTERRUPTED_STATUS}"')
     quote = _neutralise_tags(_reply_quote(m.reply_to_data))
     text = _neutralise_tags(m.content)
     inner = f"{quote}\n{text}" if quote else text
@@ -1642,7 +2002,8 @@ def _format_message_block(m: _QueuedMessage) -> str:
 
 
 def _format_batch(batch: list, room_name: str, room_id: int, is_group: bool) -> str:
-    if len(batch) == 1:
+    interrupted = any(getattr(m, "interrupted", False) for m in batch)
+    if len(batch) == 1 and not interrupted:
         m = batch[0]
         header = _build_message_header(room_name, room_id, is_group, m.sender, m.reply_to_data)
         return f"{header}\n{m.content}"
@@ -1652,10 +2013,11 @@ def _format_batch(batch: list, room_name: str, room_id: int, is_group: bool) -> 
         if m.sender not in senders:
             senders.append(m.sender)
     room_type = "group" if is_group else "DM"
-    lines = [
-        f"[Room: {room_name} (id:{room_id}, {room_type}) | From: {', '.join(senders)}]",
-        _BATCH_INTRO.format(n=len(ordered)),
-    ]
+    lines = [f"[Room: {room_name} (id:{room_id}, {room_type}) | From: {', '.join(senders)}]"]
+    if len(ordered) > 1:
+        lines.append(_BATCH_INTRO.format(n=len(ordered)))
+    if interrupted:
+        lines.append(_INTERRUPTED_NOTE)
     lines.extend(_format_message_block(m) for m in ordered)
     return "\n".join(lines)
 
@@ -1750,7 +2112,9 @@ async def _process_turn(state: RoomState, ctx: _TurnContext) -> None:
     batch = ctx.batch
     senders = ", ".join(dict.fromkeys(m.sender for m in batch))
     log_prefix = f"[Room {key}] [{senders}]"
-    reply_to_id = None if state.external else _first_msg_id(batch)
+    # Reply to the newest message when earlier ones were interrupted (their own
+    # turn's bubble already replies to them).
+    reply_to_id = None if state.external else _first_msg_id([m for m in batch if not m.interrupted] or batch)
     logger.info(f"{log_prefix} Processing batch of {len(batch)}: {batch[0].content[:80]!r}")
 
     _fire_typing(room_id, _STATUS_GENERATING)
@@ -1793,6 +2157,8 @@ async def _process_turn(state: RoomState, ctx: _TurnContext) -> None:
             existing_session_id = _get_session_id(key)
             user_content = base_user_content
             refresh_epoch = None  # set when this turn re-sends a condensed memory.md
+            ctx.memory_refresh_pending = None
+            ctx.accepted = False
             if existing_session_id:
                 # Context already in history — don't re-inject PROMPT.md every turn.
                 # memory.md was condensed since this session's first-turn copy:
@@ -1800,6 +2166,7 @@ async def _process_turn(state: RoomState, ctx: _TurnContext) -> None:
                 # conversation.
                 if (_room_sessions.get(key) or {}).get("memory_refresh"):
                     refresh_epoch = _sessions_epoch
+                    ctx.memory_refresh_pending = (existing_session_id, refresh_epoch)
                     user_content = f"{_memory_refresh_block()}\n\n{user_content}"
                     logger.info(f"{log_prefix} Re-sending condensed memory.md to session {existing_session_id}")
                 # Append the memory-flush hint only when due (threshold) or when
@@ -1902,10 +2269,7 @@ async def _process_turn(state: RoomState, ctx: _TurnContext) -> None:
             # The refreshed memory is now in the session history (llm-api
             # persists the user turn even when the stream was cut short).
             # Keep the flag if another condensation landed meanwhile.
-            entry = _room_sessions.get(key)
-            if (isinstance(entry, dict) and entry.get("session_id") == existing_session_id
-                    and _sessions_epoch == refresh_epoch and entry.pop("memory_refresh", None)):
-                _save_room_sessions()
+            _clear_memory_refresh(key, existing_session_id, refresh_epoch)
 
         elapsed = time.monotonic() - start
         logger.info(f"{log_prefix} Completed in {elapsed:.1f}s, reply={len(reply or '')} chars")
@@ -1926,6 +2290,15 @@ async def _process_turn(state: RoomState, ctx: _TurnContext) -> None:
         _fire_stop_typing(room_id)
 
 
+def _clear_memory_refresh(key, session_id: str | None, epoch: int) -> None:
+    """The refreshed memory is in the session history: drop the refresh flag
+    (kept if another condensation landed meanwhile)."""
+    entry = _room_sessions.get(key)
+    if (isinstance(entry, dict) and entry.get("session_id") == session_id
+            and _sessions_epoch == epoch and entry.pop("memory_refresh", None)):
+        _save_room_sessions()
+
+
 def _capture_session(state: RoomState, ctx: _TurnContext, session_id: str | None,
                      existing_session_id: str | None, log_prefix: str) -> None:
     """Record the session id as soon as it is known (header / first SSE event).
@@ -1934,6 +2307,14 @@ def _capture_session(state: RoomState, ctx: _TurnContext, session_id: str | None
     happened mid-turn. A session created across a memory condensation (epoch
     changed) is kept but flagged for a memory refresh on its next turn.
     """
+    # The request reached llm-api: it persists the user turn even if this turn
+    # is cancelled (@stop / preempt), so the one-shot memory re-send is done —
+    # don't prepend the same block again on the next attempt.
+    ctx.accepted = True
+    pending = ctx.memory_refresh_pending
+    if pending is not None:
+        ctx.memory_refresh_pending = None
+        _clear_memory_refresh(state.key, pending[0], pending[1])
     if not session_id:
         return
     ctx.session_id = session_id
@@ -2084,6 +2465,7 @@ async def _process_sync(state: RoomState, ctx: _TurnContext, llm_data: dict, hea
     attempt = 0
     while True:
         try:
+            ctx.posted = True
             response = await _llm_client().post(
                 f"{config.LLM_API_URL}/v1/chat/completions",
                 data=llm_data,
@@ -2170,23 +2552,113 @@ _DRAFT_EDIT_INTERVAL_SECONDS = 0.1
 
 _STOP_MARKER = "⏹️ 중지됨"
 _INTERRUPT_MARKER = "⏹️ 중지됨 (이어서 온 메시지와 합쳐 다시 답할게요)"
+_PREEMPT_MARKER = "⏹️ 새 메시지가 와서 여기서 중단했어요 — 이어서 답할게요"
 _SHUTDOWN_MARKER = "⏹️ 재시작으로 중단됨 (다시 시작하면 이어서 답할게요)"
 
 # Draft-bubble creations that definitely failed (never reached Messenger)
 # before the turn gives up on a live draft and only posts the final reply.
 _DRAFT_CREATE_MAX_MISSES = 3
 
+# A running tool shows its elapsed time (typing indicator / worklog) once it has
+# run this long; shorter calls just read "⏳ label …".
+_TOOL_ELAPSED_SHOW_SECONDS = 5.0
+# A live process that produced no output for this long is shown as "출력 없음 N초".
+_PROCESS_IDLE_SHOW_SECONDS = 5.0
+# tool_status "progress" events (every ~10s per running tool) update the worklog
+# in the draft bubble at most this often, so many tools / frequent progress can
+# never cause an edit storm (text streaming has its own coalesced limiter).
+_PROGRESS_FLUSH_MIN_INTERVAL_SECONDS = 4.0
+# Max live-process lines shown under one worklog entry.
+_PROCESS_LINES_PER_TOOL = 2
 
-def _format_tool_status(running_tools: dict[str, str]) -> str:
+
+def _as_float(value, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number == number and number >= 0 else default  # NaN / negative
+
+
+def _fmt_duration(seconds) -> str:
+    """Korean compact duration: 45초 / 1분 20초 / 2시간 5분."""
+    total = int(_as_float(seconds))
+    if total < 60:
+        return f"{total}초"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}분 {secs}초" if secs else f"{minutes}분"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}시간 {minutes}분" if minutes else f"{hours}시간"
+
+
+def _one_line(value, limit: int) -> str:
+    """Collapse whitespace/newlines and trim — safe for one-line display."""
+    text = " ".join(str(value or "").split())
+    if limit > 0 and len(text) > limit:
+        text = text[: max(1, limit - 1)] + "…"
+    return text
+
+
+def _process_line(proc: dict, command_limit: int = 60, indent: str = "   ") -> str:
+    """`   ↳ pid 1234 · python train.py · 출력 없음 45초` for one live process.
+
+    Accepts both the SSE key (`idle`) and the llm-api snapshot key
+    (`idle_seconds`)."""
+    pid = proc.get("pid")
+    parts = [f"pid {pid}" if pid is not None else "pid ?"]
+    command = _one_line(proc.get("command"), command_limit)
+    if command:
+        parts.append(command)
+    idle = proc.get("idle_seconds", proc.get("idle"))
+    if idle is not None and _as_float(idle, -1.0) >= _PROCESS_IDLE_SHOW_SECONDS:
+        parts.append(f"출력 없음 {_fmt_duration(idle)}")
+    elif idle is not None:
+        parts.append("출력 중")
+    elif proc.get("elapsed") is not None:
+        parts.append(f"{_fmt_duration(proc.get('elapsed'))}째")
+    return f"{indent}↳ " + " · ".join(parts)
+
+
+def _entry_elapsed(entry: dict) -> float:
+    """Seconds a running worklog entry has been running (local clock anchored
+    by the server's last reported `elapsed`, so it keeps ticking between
+    progress events)."""
+    t0 = entry.get("t0")
+    if isinstance(t0, (int, float)):
+        return max(0.0, time.monotonic() - t0)
+    return _as_float(entry.get("elapsed"))
+
+
+def _format_tool_status(running_tools: dict[str, str], entries: dict | None = None) -> str:
     """Return the typing-indicator text for the current set of running tools.
 
     Preserves insertion order so the indicator reads `websearch + code_exec
     사용 중` in the order the tools started. Falls back to the generating
-    status when no tool is active.
+    status when no tool is active. With *entries* (tool_call_id -> worklog
+    entry) the longest-running tool is shown with its elapsed time and call
+    detail once it has run for a while, e.g.
+    `file_navigator 1분 20초째 사용 중 (list /srv/data)`.
     """
     if not running_tools:
         return _STATUS_GENERATING
-    return " + ".join(running_tools.values()) + " 사용 중"
+    base = " + ".join(running_tools.values()) + " 사용 중"
+    if not entries:
+        return base
+    longest_name, longest_elapsed, longest_detail = "", 0.0, ""
+    for key, name in running_tools.items():
+        entry = entries.get(key)
+        if not entry:
+            continue
+        elapsed = _entry_elapsed(entry)
+        if elapsed > longest_elapsed:
+            longest_name, longest_elapsed, longest_detail = name, elapsed, entry.get("detail") or ""
+    if not longest_name or longest_elapsed < _TOOL_ELAPSED_SHOW_SECONDS:
+        return base
+    detail = _one_line(longest_detail, 40)
+    if len(running_tools) == 1:
+        return f"{longest_name} {_fmt_duration(longest_elapsed)}째 사용 중" + (f" ({detail})" if detail else "")
+    return f"{base} — {longest_name} {_fmt_duration(longest_elapsed)}째"
 
 
 def _render_tool_log(tool_log: list[dict]) -> str:
@@ -2194,24 +2666,44 @@ def _render_tool_log(tool_log: list[dict]) -> str:
 
     Unlike the transient bottom typing indicator (which only shows tools that
     are running *right now*), this persists every tool call in start order with
-    its outcome — ⏳ running, ✅ done (+elapsed), ❌ failed — so the user can see
-    what actually ran. The client renderer supports only bold/italic/code, so
-    this uses emoji + plain text.
+    its outcome — ⏳ running (+detail, elapsed and up to two live OS processes
+    with their idle time), ✅ done (+duration), ❌ failed (+the reason when the
+    call was stopped), ⏹️ stopped with the turn, 🛡️ supervisor review — so the
+    user can see what actually ran. The client renderer supports only
+    bold/italic/code, so this uses emoji + plain text.
     """
     if not tool_log:
         return ""
-    icons = {"running": "⏳", "completed": "✅", "failed": "❌"}
+    icons = {"running": "⏳", "completed": "✅", "failed": "❌", "stopped": "⏹️"}
     lines = ["🔧 **작업**"]
     for e in tool_log:
-        icon = icons.get(e.get("state"), "•")
+        state = e.get("state")
         label = e.get("label") or "?"
-        if e.get("state") == "completed":
+        detail = _one_line(e.get("detail"), 100)
+        if e.get("kind") == "supervisor":
+            title = label if label.startswith("진행 점검") else f"진행 점검: {label}"
+            lines.append(f"🛡️ {title}" + (f" — {detail}" if detail else ""))
+            continue
+        icon = icons.get(state, "•")
+        if state == "completed":
             dur = e.get("duration") or 0.0
             lines.append(f"{icon} {label}" + (f" · {dur:.1f}s" if dur else ""))
-        elif e.get("state") == "failed":
-            lines.append(f"{icon} {label} · 실패")
+        elif state == "failed":
+            line = f"{icon} {label} · 실패"
+            if detail.lower().startswith("stopped"):
+                line += f" — {detail}"
+            lines.append(line)
+        elif state == "stopped":
+            lines.append(f"{icon} {label} · 중단됨")
         else:
-            lines.append(f"{icon} {label} …")
+            line = f"{icon} {label}"
+            if detail:
+                line += f" — {detail}"
+            elapsed = _entry_elapsed(e)
+            line += f" · {_fmt_duration(elapsed)}" if elapsed >= _TOOL_ELAPSED_SHOW_SECONDS else " …"
+            lines.append(line)
+            for proc in [p for p in (e.get("processes") or []) if isinstance(p, dict)][:_PROCESS_LINES_PER_TOOL]:
+                lines.append(_process_line(proc))
     return "\n".join(lines)
 
 
@@ -2260,6 +2752,8 @@ async def _process_streaming(state: RoomState, ctx: _TurnContext, llm_data: dict
     draft_msg_id: int | None = None   # ID of the live text-draft message in chat
     last_draft_edit: float = 0.0
     first_sent = False
+    last_progress_flush: float = 0.0   # monotonic time of the last progress-driven flush
+    supervisor_seq = 0                 # unique keys for id-less supervisor notices
 
     saw_done = False
     received_any = False
@@ -2273,7 +2767,7 @@ async def _process_streaming(state: RoomState, ctx: _TurnContext, llm_data: dict
         """Periodically re-fire the typing event so the indicator stays visible."""
         while True:
             await asyncio.sleep(_TYPING_REFRESH_INTERVAL_SECONDS)
-            _fire_typing(room_id, _format_tool_status(running_tools))
+            _fire_typing(room_id, _format_tool_status(running_tools, tool_log_index))
 
     refresh_task = asyncio.create_task(_refresh_typing())
 
@@ -2466,6 +2960,13 @@ async def _process_streaming(state: RoomState, ctx: _TurnContext, llm_data: dict
             notices.append(_truncated_notice(f"finish_reason={fr}"))
 
         text = "\n\n".join(p for p in [body, *notices] if p)
+        # A stream that ended without completion events (dropped connection,
+        # server restart/stop, idle timeout) must not leave tools frozen as
+        # running — with live pid lines — in the permanent final message.
+        for entry in tool_log:
+            if entry.get("state") == "running" and entry.get("kind") != "supervisor":
+                entry["state"] = "stopped"
+                entry["processes"] = []
         final_text = _compose_draft(text)
         await _final_write(final_text)
         return final_text
@@ -2475,12 +2976,20 @@ async def _process_streaming(state: RoomState, ctx: _TurnContext, llm_data: dict
         nonlocal finalize_started
         finalize_started = True
         await _settle_flush()
-        if ctx.cancel_reason == "interrupt":
+        if ctx.cancel_reason == "preempt":
+            marker = _PREEMPT_MARKER
+        elif ctx.cancel_reason == "interrupt":
             marker = _INTERRUPT_MARKER
         elif ctx.cancel_reason == "shutdown":
             marker = _SHUTDOWN_MARKER
         else:
             marker = _STOP_MARKER
+        # Calls still running when the turn was cancelled show as stopped
+        # (the server kills their processes), not as eternally running.
+        for entry in tool_log:
+            if entry.get("state") == "running" and entry.get("kind") != "supervisor":
+                entry["state"] = "stopped"
+                entry["processes"] = []
         body = full_text.strip()
         if draft_msg_id is None and not body:
             return  # nothing was shown; the @stop handler announces the stop
@@ -2489,6 +2998,7 @@ async def _process_streaming(state: RoomState, ctx: _TurnContext, llm_data: dict
 
     async def _consume(response: httpx.Response) -> None:
         nonlocal full_text, final_split_pos, last_draft_edit, first_sent
+        nonlocal supervisor_seq, last_progress_flush
         nonlocal saw_done, received_any, error_reason, error_is_overflow, diagnostics, finish_reason
         lines = response.aiter_lines()
         while True:
@@ -2508,6 +3018,12 @@ async def _process_streaming(state: RoomState, ctx: _TurnContext, llm_data: dict
                 error_reason = f"{type(exc).__name__}: {exc}".strip()
                 return
 
+            # Python <= 3.11's asyncio.wait_for can swallow a cancellation that
+            # lands in the same loop iteration its inner read completes. The
+            # canceller always records why first, so honour that here instead of
+            # streaming on (a preempted/stopped turn must not keep running).
+            if ctx.cancel_reason is not None and not ctx.finalized:
+                raise asyncio.CancelledError()
             received_any = True
             if not line.startswith("data:"):
                 continue  # SSE comments / keepalive pings
@@ -2540,37 +3056,77 @@ async def _process_streaming(state: RoomState, ctx: _TurnContext, llm_data: dict
                 return
 
             if "tool_status" in event:
-                ts = event["tool_status"] or {}
-                tool_name = ts.get("tool_name", "")
-                # Text streamed before a tool event is work narration, not
-                # the final answer — remember the boundary for the divider.
-                # Autocompact is server housekeeping, not a tool call: it
-                # never turns already-streamed text into narration.
-                if tool_name != "autocompact":
-                    final_split_pos = len(full_text)
-                tool_key = ts.get("tool_call_id") or tool_name
-                status = ts.get("status", "")
+                if not isinstance(event["tool_status"], dict):
+                    continue
+                ts = event["tool_status"]
+                tool_name = str(ts.get("tool_name") or "")
+                status = str(ts.get("status") or "")
+                is_progress = status == "progress"
+                is_supervisor = tool_name == "supervisor"
+                raw_id = ts.get("tool_call_id") or ""
+                if is_supervisor and not raw_id:
+                    # Id-less supervisor notices are distinct events — a shared
+                    # key would fold them into one entry.
+                    supervisor_seq += 1
+                    tool_key = f"supervisor#{supervisor_seq}"
+                else:
+                    tool_key = raw_id or tool_name
                 label = ts.get("user_name") or ts.get("activity") or tool_name
-                if status == "started":
-                    running_tools[tool_key] = tool_name
-                    entry = tool_log_index.get(tool_key)
-                    if entry is None:
-                        entry = {"label": label, "state": "running", "duration": 0.0}
-                        tool_log.append(entry)
-                        tool_log_index[tool_key] = entry
-                    else:
+                if is_supervisor:
+                    label = "진행 점검"
+                entry = tool_log_index.get(tool_key)
+                # A late progress event for a call that already finished is stale.
+                if is_progress and entry is not None and entry.get("state") in {"completed", "failed", "stopped"}:
+                    continue
+                # Text streamed before a tool event is work narration, not the
+                # final answer — remember the boundary for the divider. Only a
+                # call's first appearance moves it (not its progress ticks), and
+                # autocompact is server housekeeping, not a tool call: it never
+                # turns already-streamed text into narration.
+                if tool_name != "autocompact" and not (is_progress and entry is not None):
+                    final_split_pos = len(full_text)
+                if entry is None:
+                    entry = {"label": label, "state": "running", "duration": 0.0}
+                    if is_supervisor:
+                        entry["kind"] = "supervisor"
+                    tool_log.append(entry)
+                    tool_log_index[tool_key] = entry
+                    if status in {"started", "progress"}:
+                        entry["t0"] = time.monotonic()
+                detail = _one_line(ts.get("detail"), 120)
+                if detail:
+                    entry["detail"] = detail
+                if status in {"started", "progress"}:
+                    if not is_supervisor:
+                        running_tools[tool_key] = tool_name
+                    if entry.get("state") != "running":
                         entry["state"] = "running"
+                        entry["t0"] = time.monotonic()
+                    if ts.get("elapsed") is not None:
+                        # Re-anchor the local clock on the server's elapsed so
+                        # the displayed time stays right between progress ticks.
+                        entry["elapsed"] = _as_float(ts.get("elapsed"))
+                        entry["t0"] = time.monotonic() - entry["elapsed"]
+                    if isinstance(ts.get("processes"), list):
+                        entry["processes"] = [p for p in ts["processes"] if isinstance(p, dict)][:3]
+                    elif status == "started":
+                        entry["processes"] = []
                 elif status in {"completed", "failed"}:
                     running_tools.pop(tool_key, None)
-                    entry = tool_log_index.get(tool_key)
-                    if entry is None:
-                        entry = {"label": label, "state": status, "duration": ts.get("duration") or 0.0}
-                        tool_log.append(entry)
-                        tool_log_index[tool_key] = entry
-                    else:
-                        entry["state"] = status
-                        entry["duration"] = ts.get("duration") or entry.get("duration") or 0.0
-                _fire_typing(room_id, _format_tool_status(running_tools))
+                    entry["state"] = status
+                    entry["duration"] = ts.get("duration") or entry.get("duration") or 0.0
+                    entry["processes"] = []
+                if is_progress:
+                    # Progress ticks refresh the elapsed/process lines, but at
+                    # most every few seconds — many tools reporting at once
+                    # must not become an edit storm.
+                    now = time.monotonic()
+                    if now - last_progress_flush >= _PROGRESS_FLUSH_MIN_INTERVAL_SECONDS:
+                        last_progress_flush = now
+                        _fire_typing(room_id, _format_tool_status(running_tools, tool_log_index))
+                        _schedule_flush(_compose_draft(full_text))
+                    continue
+                _fire_typing(room_id, _format_tool_status(running_tools, tool_log_index))
                 # Update the in-bubble checklist live — tools often run before
                 # any answer text, so this may create the draft bubble too.
                 _schedule_flush(_compose_draft(full_text))
@@ -2606,6 +3162,7 @@ async def _process_streaming(state: RoomState, ctx: _TurnContext, llm_data: dict
             delay = None
             counted = True
             try:
+                ctx.posted = True
                 async with _llm_client().stream(
                     "POST",
                     f"{config.LLM_API_URL}/v1/chat/completions",

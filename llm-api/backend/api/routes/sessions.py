@@ -6,6 +6,7 @@ Session management endpoints
 /api/chat/history/{session_id} - Get conversation history
 """
 import asyncio
+import json
 import time
 
 import anyio
@@ -33,9 +34,17 @@ _COMPACT_POLL_SECONDS = 1.0
 # a stop the agent loop hasn't honoured within the grace period is enforced by
 # cancelling the run; cancellation cleanup (process-tree kills, tool-task
 # reaping) gets at most _STOP_CLEANUP_SECONDS before the stop is reported.
+# Kept short on purpose: a newer message preempting a running turn (hoonbot
+# "preempt" policy) waits for the turn lease, which is only released after this
+# cleanup. Thread-run tools cannot be killed, but cancelling their awaiter
+# returns at once, so the bound is only ever reached by a wedged process kill.
 _STOP_POLL_SECONDS = 0.5
-_STOP_GRACE_SECONDS = 2.0
-_STOP_CLEANUP_SECONDS = 30.0
+_STOP_GRACE_SECONDS = 1.0
+_STOP_CLEANUP_SECONDS = 10.0
+
+# POST /sessions/{id}/stop waits at most this long for the immediate process
+# kill before answering (the kill itself keeps going in the background).
+_STOP_KILL_WAIT_SECONDS = 8.0
 
 
 async def _reap_task(task: "asyncio.Future", timeout: float) -> None:
@@ -343,9 +352,118 @@ async def compact_session(
         lease.release()
 
 
+def _optional_module(name: str):
+    """Import module *name* defensively (None if unavailable/broken)."""
+    try:
+        import importlib
+        return importlib.import_module(name)
+    except Exception:
+        return None
+
+
+def _json_safe(value: Any) -> Any:
+    """Round-trip through JSON so odd values (sets, Paths, ...) can't break a response."""
+    try:
+        return json.loads(json.dumps(value, default=str))
+    except Exception:
+        return None
+
+
+async def _kill_session_processes(session_id: str, include_background: bool = False) -> int:
+    """Immediately kill the registered OS processes of *session_id* (and its subagents).
+
+    By default only FOREGROUND tool processes are killed (shell_exec,
+    code_exec, ...): processes the agent deliberately started in the
+    background via process_monitor are long-lived work that a newer message
+    preempting the turn must not destroy; pass include_background=True to kill
+    those too. Never raises; returns the number of processes killed.
+    """
+    lifecycle = _optional_module("backend.utils.proc_lifecycle")
+    kill = getattr(lifecycle, "kill_processes", None) if lifecycle else None
+    if kill is None:
+        return 0
+    snapshot = getattr(lifecycle, "snapshot_processes", None)
+    reason = "stopped by user"
+
+    fire_hooks = getattr(lifecycle, "_fire_cancel_hooks", None)
+
+    async def _do() -> int:
+        # Thread-based tools (file_navigator / file_reader / grep fallback)
+        # register a cooperative cancel hook but no OS process, so the
+        # per-entry kill below would never reach them. Fire the session's
+        # hooks (children included) up front; kill_processes re-fires them
+        # harmlessly (Deadline.cancel is idempotent).
+        if fire_hooks is not None:
+            try:
+                fire_hooks(session_id, None, True)
+            except Exception:
+                pass
+        if include_background or snapshot is None:
+            return int(
+                await kill(
+                    session_id=session_id,
+                    reason=reason,
+                    include_background=include_background,
+                ) or 0
+            )
+        entries = [e for e in (snapshot(session_id) or []) if isinstance(e, dict)]
+        monitor_sessions = {
+            e.get("session_id") for e in entries if e.get("tool") == "process_monitor"
+        }
+        total = 0
+        seen = set()
+        for entry in entries:
+            if entry.get("tool") == "process_monitor":
+                continue
+            sid = entry.get("session_id") or session_id
+            call_id = entry.get("tool_call_id") or None
+            if call_id is None and sid in monitor_sessions:
+                # Untagged foreground entry next to a background monitor in the
+                # same session: a session-wide kill would take the monitor with
+                # it. The run's own cancellation kills the foreground one.
+                continue
+            key = (sid, call_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            total += int(
+                await kill(
+                    session_id=sid,
+                    tool_call_id=call_id,
+                    reason=reason,
+                    include_children_sessions=False,
+                ) or 0
+            )
+        return total
+
+    task = asyncio.ensure_future(_do())
+    task.add_done_callback(lambda t: t.cancelled() or t.exception())
+    try:
+        # Not cancelled on timeout/caller cancellation: a half-finished kill
+        # is worse than a slow one, and the task reaps itself.
+        await asyncio.wait({task}, timeout=_STOP_KILL_WAIT_SECONDS)
+        if task.done() and not task.cancelled() and task.exception() is None:
+            return task.result()
+    except Exception:
+        pass
+    return 0
+
+
+def _check_session_access(session_id: str, current_user: Optional[dict]) -> dict:
+    """404 unknown session / 403 foreign session (same rule as sibling routes)."""
+    session = db.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if current_user:
+        if session["username"] != current_user["username"] and session["username"] != "guest":
+            raise HTTPException(status_code=403, detail="Access denied")
+    return session
+
+
 @router.post("/sessions/{session_id}/stop")
 async def stop_session(
     session_id: str,
+    include_background: bool = False,
     current_user: Optional[dict] = Depends(get_optional_user),
 ):
     """Halt the in-flight agent loop for this session.
@@ -353,7 +471,13 @@ async def stop_session(
     The loop honours the marker at its next checkpoint; if it is blocked in a
     long tool (serial shell_exec / code_exec) or LLM call, the chat/jobs route
     running it cancels the run after a short grace period
-    (stop_enforced_events), killing the tool's process tree.
+    (stop_enforced_events), killing the tool's process tree. On top of that,
+    the OS processes registered for the session's running tool calls are
+    killed right away (after the marker is written), so the awaiting tool
+    returns "stopped: ..." immediately and the turn lease is released fast —
+    a newer message can then run without waiting out a long command.
+    Background processes started through process_monitor survive unless
+    `?include_background=true`.
 
     A running manual POST /sessions/{id}/compact is stopped the same way: its
     summarizer call is cancelled and the history is left unchanged.
@@ -367,23 +491,91 @@ async def stop_session(
     the run ends) or a manual compaction. Best effort: it is a snapshot that
     can change right after it is taken.
     """
-    session = db.get_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    if current_user:
-        if session["username"] != current_user["username"] and session["username"] != "guest":
-            raise HTTPException(status_code=403, detail="Access denied")
+    _check_session_access(session_id, current_user)
 
     running = conversation_store.is_turn_active(session_id)
 
     from backend.utils.stop_signal import request_session_stop
+    # Marker first: when the kill below makes a tool return "stopped", the loop
+    # must already see the stop at its next checkpoint instead of carrying on.
     request_session_stop(session_id)
+
+    killed = 0
+    try:
+        killed = await _kill_session_processes(session_id, include_background)
+    except Exception as exc:  # best effort — the marker is already written
+        print(f"[STOP] session {session_id}: process kill failed: {type(exc).__name__}: {exc}")
 
     return {
         "success": True,
         "running": running,
+        "killed_processes": killed,
         "message": f"Stop requested for session {session_id}",
+    }
+
+
+@router.get("/sessions/{session_id}/activity")
+async def session_activity(
+    session_id: str,
+    current_user: Optional[dict] = Depends(get_optional_user),
+):
+    """Live view of what a session is doing right now.
+
+    Returns {session_id, busy, turn, tools, processes}: `busy` is whether a turn
+    (or /jobs run / compaction) holds the session lease, `turn` the agent's
+    turn snapshot (elapsed, iteration, state, idle) or null, `tools` the tool
+    calls currently running (tool, detail, elapsed, live processes) and
+    `processes` the registered OS processes (pid, command, elapsed, idle,
+    tail). Same auth/ownership rules as the sibling session routes; apart from
+    404/403 it never fails — pieces that can't be gathered come back empty.
+    """
+    _check_session_access(session_id, current_user)
+
+    try:
+        busy = bool(conversation_store.is_turn_active(session_id))
+    except Exception:
+        busy = False
+
+    turn = None
+    tools: list = []
+    watchdog = _optional_module("backend.agent.watchdog")
+    if watchdog is not None:
+        try:
+            fn = getattr(watchdog, "snapshot_turn", None)
+            turn = _json_safe(fn(session_id)) if fn else None
+        except Exception:
+            turn = None
+        try:
+            fn = getattr(watchdog, "snapshot_running", None)
+            tools = _json_safe(fn(session_id)) if fn else []
+        except Exception:
+            tools = []
+    if not isinstance(tools, list):
+        tools = []
+
+    processes: list = []
+    lifecycle = _optional_module("backend.utils.proc_lifecycle")
+    if lifecycle is not None:
+        try:
+            fn = getattr(lifecycle, "snapshot_processes", None)
+            processes = _json_safe(fn(session_id)) if fn else []
+        except Exception:
+            processes = []
+    if not isinstance(processes, list):
+        processes = []
+
+    try:
+        stop_pending = bool(is_stop_requested(session_id))
+    except Exception:
+        stop_pending = False
+
+    return {
+        "session_id": session_id,
+        "busy": busy,
+        "stop_pending": stop_pending,
+        "turn": turn,
+        "tools": tools,
+        "processes": processes,
     }
 
 

@@ -421,6 +421,52 @@ TOOL_PARAMETERS = {
 }
 
 # ============================================================================
+# Live tool visibility + supervisor ("watchdog") — backend/agent/watchdog.py
+# ============================================================================
+# Progress events: while a tool runs longer than TOOL_PROGRESS_AFTER_SECONDS the
+# agent loop streams a ToolStatusEvent(status="progress") every
+# TOOL_PROGRESS_INTERVAL_SECONDS (elapsed time, call summary, live OS processes).
+TOOL_PROGRESS_AFTER_SECONDS = 6
+TOOL_PROGRESS_INTERVAL_SECONDS = 10
+# Hard wall-clock cap for in-process (thread) tools — they have no timeout
+# parameter, and a thread cannot be killed, so the dispatcher stops WAITING
+# (the call returns a structured error; the worker thread is abandoned).
+# shell_exec / code_exec / agent keep their own timeouts and caps. A per-tool
+# value in TOOL_HARD_TIMEOUTS wins over TOOL_DEFAULT_HARD_TIMEOUT_SECONDS.
+TOOL_DEFAULT_HARD_TIMEOUT_SECONDS = 180
+TOOL_HARD_TIMEOUTS = {
+    "file_navigator": 60,
+    "file_reader": 60,
+    "grep": 120,
+    "shell_lint": 60,
+    "websearch": 90,
+    "rag": 300,
+    "memo": 30,
+    "process_monitor": 60,   # every operation is a quick registry/pipe read
+    "todo_write": 30,
+}
+# Tool watchdog: a long-running tool call (WATCHDOG_AFTER_SECONDS, then every
+# WATCHDOG_INTERVAL_SECONDS) is shown to a separate, tool-less supervisor LLM
+# call that answers {"action":"continue"|"stop"}; ANY failure means continue.
+# A foreground process silent for WATCHDOG_STALL_SECONDS is stopped without the
+# LLM. The `agent` (subagent) and `process_monitor` tools are never judged.
+WATCHDOG_ENABLED = True
+WATCHDOG_AFTER_SECONDS = 180
+WATCHDOG_INTERVAL_SECONDS = 120
+WATCHDOG_STALL_SECONDS = 600
+WATCHDOG_MAX_TOKENS = 300
+WATCHDOG_LLM_TIMEOUT_SECONDS = 90   # a hung supervisor call fails open (continue)
+# Turn review (big-job backup): at an iteration boundary, once a turn has run
+# longer than TURN_REVIEW_AFTER_SECONDS (then every TURN_REVIEW_INTERVAL_SECONDS
+# or TURN_REVIEW_EVERY_ITERATIONS iterations), the supervisor answers
+# {"verdict":"continue"|"replan"|"wrap_up"}; replan/wrap_up inject a
+# non-persisted nudge before the next LLM call.
+TURN_REVIEW_ENABLED = True
+TURN_REVIEW_AFTER_SECONDS = 900
+TURN_REVIEW_INTERVAL_SECONDS = 900
+TURN_REVIEW_EVERY_ITERATIONS = 40
+
+# ============================================================================
 # Microcompaction: Tool Result Budgets (chars)
 # ============================================================================
 # Max chars of a tool result fed back to the model inline. Larger results are

@@ -101,8 +101,8 @@ On shutdown the lifespan cancels catch-up and calls `handlers.webhook.shutdown_r
 **Message flow:**
 1. Validate (text/image/file, not bot, @mention in non-home rooms)
 2. Mark read (fire-and-forget)
-3. `@stop` / `@clear` run immediately; other messages enter the per-room FIFO queue
-4. Debounce (`DEBOUNCE_SECONDS`), then the room worker takes up to `BATCH_MAX_MESSAGES` queued messages as one labelled batch; messages arriving mid-turn wait for the next turn (`FOLLOWUP_POLICY="queue"`) or interrupt it (`"interrupt"`, same sender only)
+3. `@stop` / `@status` / `@clear` run immediately; other messages enter the per-room FIFO queue
+4. Debounce (`DEBOUNCE_SECONDS`), then the room worker takes up to `BATCH_MAX_MESSAGES` queued messages as one labelled batch; messages arriving mid-turn are handled by `FOLLOWUP_POLICY` (default `"preempt"`, see **Follow-up policy** below)
 5. `process_message()` — builds context and calls LLM
 
 **New session context injection** (`core/context.py::build_llm_context`):
@@ -114,9 +114,17 @@ On shutdown the lifespan cancels catch-up and calls `handlers.webhook.shutdown_r
 
 **Memory flush:** At message #`MEMORY_FLUSH_THRESHOLD` (default 30) in a session, or when memory.md is over the soft cap, `prompts/webhook/memory_flush_hint.txt` is injected (formatted with `{memory_chars}` / `{memory_cap}`), nudging the agent to save durable facts with targeted `file_edit`/`apply_patch` edits and prune stale entries.
 
+**Follow-up policy** (`FOLLOWUP_POLICY`, set in `cluster_config.py`):
+- `preempt` (default): a human message that arrives while a turn is running does not wait. Once its burst has been quiet for `DEBOUNCE_SECONDS`, the room worker cancels the running turn if it is still in its working phase. The turn's draft bubble is settled by edit with the partial text plus `⏹️ 새 메시지가 와서 여기서 중단했어요 — 이어서 답할게요`, tools still running in it show as stopped, and hoonbot calls `POST /api/chat/sessions/{id}/stop` (`llm_api.stop_session`) so llm-api kills the tools' processes and releases the session lease. The worker then waits (bounded) for the lease to clear (`llm_api.get_activity`) and starts the new turn at once. The new batch carries the interrupted message(s) again, sorted by message id and flagged `status="interrupted-earlier-request"`, with a line telling the model not to repeat work already done. The room's llm-api session is reused, never reset, so its history already holds the interrupted partial turn and tool ledger. Interrupted messages stay in `data/room_queue.json` until a turn that includes them ends.
+- A turn is not preemptable once it is finalizing (writing the answer), delegating to the cluster, or running an in-queue directive such as `@compact`. The follow-up then falls back to `queue` behaviour: it waits with the ⏳ reaction and runs after the current turn. A directive at the head of the queue (`@compact`, `/goal`, a queued `@clear`) never preempts, so order is kept. Only messages that arrived after the running turn started can preempt it (overflow beyond `BATCH_MAX_MESSAGES` that was already queued cannot), and a message preempted `_PREEMPT_MAX_PER_BATCH` (3) times is no longer preempted: its turn runs to completion and newer messages queue behind it. Messages deleted while their turn is running are not re-queued after a preempt (edits are carried over). A message whose turn never reached llm-api is re-queued without the `interrupted-earlier-request` flag. An unknown `FOLLOWUP_POLICY` value falls back to `queue` with a warning.
+- `queue`: the follow-up always waits for the next turn. `interrupt`: a same-sender follow-up cancels the running turn and merges with it.
+- `@stop`, `@status` and `@clear` keep their immediate handling under every policy.
+
+**`@status`** (also `/status`): runs outside the queue like `@stop`, is read-only and never preempts or cancels. It replies with whether a turn is running and for how long (working / finalizing / delegating), the number of queued messages, goal mode, and what llm-api reports from `GET /api/chat/sessions/{id}/activity` (agent turn age and iteration, running tools with detail and elapsed time, live processes with their idle time).
+
 **Queue persistence:** the msg_ids of each room's in-flight batch and waiting queue are written to `data/room_queue.json` atomically. Writes are debounced (0.5 s) on enqueue, dequeue, delete and turn end, and happen immediately during shutdown. A batch leaves the file when its turn ends (answered, errored or `@stop`ped); it stays only when shutdown cut the turn short before its final answer was being written.
 
-**Streaming:** Text streams into one threaded draft bubble that is edited in place and settled into the final reply. Tool activity shows in the typing indicator and an in-bubble checklist. Creating the draft uses `messenger.send_message_returning_id`, which returns `None` only when the message was definitely not created; a later flush retries, up to 3 times. It raises `MaybeDeliveredError` when the send may have been stored. In that case the bubble is looked up among the newest room messages instead of a second one being posted; if it cannot be found, only the final reply is sent. When llm-api already ended the text with its inline cut notice (`[출력이 길이 제한으로 잘렸습니다]` / `[응답 생성 중 연결 오류로 출력이 중단되었습니다]`), hoonbot does not add its own length/error notice.
+**Streaming:** Text streams into one threaded draft bubble that is edited in place and settled into the final reply. Tool activity shows in the typing indicator and an in-bubble checklist. While a tool runs, llm-api sends `tool_status` events with `status: "progress"` (plus `detail`, `elapsed` and `processes`); the typing indicator then names the longest-running tool with its elapsed time (`file_navigator 1분 20초째 사용 중 (list /srv/data)`), and its worklog line reads `⏳ label — detail · 1분 20초` with up to two indented process lines (`↳ pid 1234 · python train.py · 출력 없음 45초`). Progress updates reach the bubble at most every 4 s on top of the existing edit limiter, so many tools cannot cause an edit storm. A call killed by the supervisor or a hard timeout shows `❌ label · 실패 — stopped: <reason>`; a supervisor review entry shows as `🛡️ 진행 점검`. Creating the draft uses `messenger.send_message_returning_id`, which returns `None` only when the message was definitely not created; a later flush retries, up to 3 times. It raises `MaybeDeliveredError` when the send may have been stored. In that case the bubble is looked up among the newest room messages instead of a second one being posted; if it cannot be found, only the final reply is sent. When llm-api already ended the text with its inline cut notice (`[출력이 길이 제한으로 잘렸습니다]` / `[응답 생성 중 연결 오류로 출력이 중단되었습니다]`), hoonbot does not add its own length/error notice.
 
 ### 3. Heartbeat: `core/heartbeat.py`
 
@@ -157,7 +165,7 @@ All Hoonbot runtime settings live in `config.py`. Key settings:
 | `MESSENGER_HOME_ROOM_ID` | 1 | Fallback room for heartbeat output (name lookup first) |
 | `STREAMING_ENABLED` | True | Stream LLM responses |
 | `DEBOUNCE_SECONDS` | 1.5 | Burst-gathering window before a queued batch runs |
-| `FOLLOWUP_POLICY` | queue | Mid-turn messages: `queue` or `interrupt` (cluster_config) |
+| `FOLLOWUP_POLICY` | preempt | Mid-turn messages: `preempt` (cancel the running turn, merge), `queue` or `interrupt` (cluster_config) |
 | `ROOM_QUEUE_MAX` / `BATCH_MAX_MESSAGES` | 50 / 20 | Per-room queue bound / messages per turn |
 | `LLM_TIMEOUT_SECONDS` | 3600 | Non-streaming wall-clock cap (s) |
 | `LLM_STREAM_IDLE_TIMEOUT_SECONDS` | 900 | Streaming idle watchdog (s) |

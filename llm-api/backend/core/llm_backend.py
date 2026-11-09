@@ -93,10 +93,14 @@ class ToolStatusEvent(StreamEvent):
     """Emitted before/after tool execution for streaming visibility."""
     tool_name: str = ""
     tool_call_id: str = ""
-    status: str = ""        # "started" | "completed" | "failed"
+    status: str = ""        # "started" | "progress" | "completed" | "failed"
     duration: float = 0.0
     activity: str = ""      # human-readable spinner text, e.g. "Reading file"
     user_name: str = ""     # display name for the tool, e.g. "File Reader"
+    detail: str = ""        # short summary of the call args (<=120 chars), e.g. "list /srv/data"
+    elapsed: float = 0.0    # seconds since the tool started
+    # Live OS processes of this call (<=3): [{pid, command, elapsed, idle, tail}]
+    processes: list = field(default_factory=list)
 
 
 @dataclass
@@ -1496,6 +1500,11 @@ class VllmBackend:
     def _update_prompt_scale(self, actual_tokens: int, raw_estimate: int) -> None:
         """EMA (alpha 0.3) of actual/estimated prompt tokens, clamped [0.4, 2.0]."""
         if actual_tokens <= 0 or raw_estimate <= 0:
+            return
+        if raw_estimate < 1500:
+            # Tiny prompts (supervisor / turn-review calls) are dominated by chat
+            # template overhead and tokenize unlike the byte estimate; they would
+            # skew the scale used to size the next large request.
             return
         ratio = min(2.0, max(0.4, actual_tokens / raw_estimate))
         self._prompt_scale = min(2.0, max(0.4, 0.7 * self._prompt_scale + 0.3 * ratio))

@@ -465,6 +465,8 @@ class ShellExecTool:
                 head_bytes=HEAD_BYTES,
                 tail_bytes=TAIL_BYTES,
                 clixml_stderr=proc_lifecycle.IS_WINDOWS,
+                display_command=command,
+                tool="shell_exec",
             )
         except Exception as e:
             return {
@@ -479,6 +481,27 @@ class ShellExecTool:
         notes.extend(res.notes)
         duration = round(time.time() - start, 2)
         shell = proc_lifecycle.shell_name()
+
+        if res.stopped:
+            # kill_processes(): user @stop / supervisor verdict. Partial output.
+            result = {
+                "success": False,
+                "exit_code": res.returncode,
+                "killed": True,
+                "stopped": True,
+                "error": f"stopped: {res.stop_reason} (process tree killed)",
+                "stdout": res.stdout,
+                "stderr": res.stderr,
+                "duration": duration,
+                "command": command,
+                "pid": res.pid,
+                "shell": shell,
+            }
+            if run_command != command:
+                result["executed_command"] = run_command
+            if notes:
+                result["notes"] = notes
+            return result
 
         if res.timed_out and res.still_running:
             # Legacy mode: process still running — partial buffers only.

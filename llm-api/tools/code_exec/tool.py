@@ -123,6 +123,8 @@ class CodeExecTool:
                     timeout=exec_timeout,
                     max_output_size=self.max_output_size,
                     env=env,
+                    display_command=self._display_command(script_name, code),
+                    tool="code_exec",
                 )
             except Exception as e:
                 execution_time = time.time() - start_time
@@ -138,6 +140,17 @@ class CodeExecTool:
 
             execution_time = time.time() - start_time
             notes = list(result.notes)
+            if result.stopped:
+                msg = f"stopped: {result.stop_reason} (process tree killed)"
+                print(f"[CODE_EXEC] STOPPED: {msg}")
+                stderr = (result.stderr.rstrip("\n") + "\n" if result.stderr.strip() else "") + f"[{msg}]"
+                await self._log(self._format_result(False, -1, execution_time, result.stdout, stderr))
+                return self._result_dict(
+                    success=False, script_name=script_name, executed=True,
+                    stdout=result.stdout, stderr=stderr, returncode=-1,
+                    execution_time=execution_time, error=msg, cwd=cwd,
+                    notes=notes,
+                )
             if result.timed_out:
                 if result.idle_killed:
                     msg = (f"no output for too long; killed after {execution_time:.0f}s "
@@ -190,6 +203,17 @@ class CodeExecTool:
     def _resolve_timeout(cls, timeout: Any) -> float:
         """None/invalid/<=0 -> default (never unlimited); clamp to the hard cap."""
         return proc_lifecycle.coerce_timeout(timeout, cls._default_timeout(), cls._hard_cap())
+
+    @staticmethod
+    def _display_command(script_name: str, code: str) -> str:
+        """Registry label: script name + first meaningful code line."""
+        first = ""
+        for line in (code or "").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                first = line[:80]
+                break
+        return f"python {script_name}" + (f"  # {first}" if first else "")
 
     @staticmethod
     def _build_env(workspace: Optional[Path]) -> Dict[str, str]:

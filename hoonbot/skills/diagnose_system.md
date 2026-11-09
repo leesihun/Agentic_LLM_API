@@ -26,6 +26,7 @@ Run these in order and stop on the first failure:
 - No fallback commands unless the user asks.
 - Warn on CPU load above 95%, RAM above 70%, swap above 50%, disk above 80%, GPU temp above 80C, or VRAM above 95%.
 - Do not expose secrets from environment or config files.
+- This checks the host only. To see what the bot itself is doing right now (running turn, queue, tools, processes), tell the user to send `@status` in the room; it answers immediately without interrupting anything.
 
 ## Reply
 

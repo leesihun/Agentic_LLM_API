@@ -35,7 +35,11 @@ from backend.core.database import db, conversation_store, SessionBusyError
 from backend.core.llm_backend import TextEvent, ToolStatusEvent
 from backend.utils.file_handler import save_uploaded_files, extract_file_metadata, is_image_file, encode_image_base64
 from backend.utils.auth import get_optional_user
-from backend.utils.stop_signal import StopInferenceError, clear_session_stop
+from backend.utils.stop_signal import (
+    StopInferenceError,
+    clear_session_stop,
+    session_stop_requested_since,
+)
 from backend.api.routes.sessions import stop_enforced_events
 from backend.agent import AgentLoop
 import config
@@ -328,7 +332,10 @@ def _prepare_messages_with_files(
 
 # How long a new turn waits for the previous turn on the same session to
 # release its lease before answering 409 "session busy" (hoonbot retries 409).
-_LEASE_WAIT_SECONDS = 2.0
+# Long enough to cover the previous turn's stop cleanup (process-tree kills,
+# partial-turn persistence) when a newer message preempts it right after
+# POST /sessions/{id}/stop; ephemeral turns take no lease at all.
+_LEASE_WAIT_SECONDS = 8.0
 # Non-streaming path: how often to poll for a client disconnect.
 _DISCONNECT_POLL_SECONDS = 1.0
 # Max distinct tool names listed in the persisted ledger of a turn.
@@ -342,7 +349,17 @@ _DIAGNOSTIC_DEFAULTS: Dict[str, Any] = {
     "tool_calls": 0,
     "compactions": 0,
     "fallback_used": False,
+    "supervisor_reviews": 0,
+    "watchdog_stops": 0,
 }
+
+# Limits for the live tool_status fields (K1) sent to clients.
+_STATUS_DETAIL_MAX = 120
+_STATUS_PROCESSES_MAX = 3
+_STATUS_COMMAND_MAX = 100
+_STATUS_TAIL_MAX = 160
+# Non-tool pseudo "tools" reported through ToolStatusEvent; never part of the ledger.
+_NON_TOOL_STATUS_NAMES = frozenset({"autocompact", "supervisor"})
 
 
 def _validate_session_id(session_id: str) -> None:
@@ -356,12 +373,81 @@ def _validate_session_id(session_id: str) -> None:
         raise HTTPException(status_code=400, detail="Invalid session_id")
 
 
+def _as_float(value: Any, digits: int = 1) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if number != number or number in (float("inf"), float("-inf")):
+        return 0.0
+    return round(number, digits)
+
+
+def _trim_status_processes(processes: Any) -> List[Dict[str, Any]]:
+    """Normalise the live-process list of a tool_status event (K1).
+
+    <=3 entries of {pid, command<=100, elapsed, idle, tail<=160}; accepts the
+    registry's `idle_seconds` spelling too. Never raises.
+    """
+    out: List[Dict[str, Any]] = []
+    if not isinstance(processes, (list, tuple)):
+        return out
+    for proc in list(processes)[:_STATUS_PROCESSES_MAX]:
+        if not isinstance(proc, dict):
+            continue
+        try:
+            pid = int(proc.get("pid"))
+        except (TypeError, ValueError):
+            pid = None
+        idle = proc.get("idle", proc.get("idle_seconds"))
+        out.append({
+            "pid": pid,
+            "command": str(proc.get("command") or "")[:_STATUS_COMMAND_MAX],
+            "elapsed": _as_float(proc.get("elapsed")),
+            "idle": _as_float(idle),
+            "tail": str(proc.get("tail") or "")[-_STATUS_TAIL_MAX:],
+        })
+    return out
+
+
+def _tool_status_payload(event: ToolStatusEvent) -> Dict[str, Any]:
+    """The `tool_status` SSE object. New K1 fields are read with getattr so an
+    older ToolStatusEvent (no detail/elapsed/processes) still serialises."""
+    payload = {
+        "tool_name": event.tool_name,
+        "tool_call_id": event.tool_call_id,
+        "status": event.status,
+        "duration": event.duration,
+        "activity": event.activity,
+        "user_name": event.user_name,
+        "detail": str(getattr(event, "detail", "") or "")[:_STATUS_DETAIL_MAX],
+        "elapsed": _as_float(getattr(event, "elapsed", 0.0)),
+        "processes": _trim_status_processes(getattr(event, "processes", None)),
+    }
+    # A child-tool "started" re-emit (activity "sub:<tool>") carries the
+    # dataclass defaults, not real measurements; omit them so clients keep the
+    # parent agent call's own timer and live process lines.
+    if str(event.activity or "").startswith("sub:") and event.status == "started":
+        if not payload["elapsed"]:
+            payload.pop("elapsed")
+        if not payload["processes"]:
+            payload.pop("processes")
+    return payload
+
+
 class _TurnRecord:
     """What happened during one turn — drives persistence and diagnostics."""
 
     def __init__(self) -> None:
         self.assistant_parts: List[str] = []
         self.tools: List[Tuple[str, bool]] = []
+        # Tool calls already counted in the ledger (a call must never be
+        # counted twice, whatever mix of events the loop emitted for it).
+        self._counted_calls: set = set()
+        # Calls that started but have not completed/failed yet, in start order
+        # (call id -> (tool name, detail)). Whatever is left when a turn is cut
+        # off was running at that moment and may have had partial side effects.
+        self._running_calls: Dict[str, Tuple[str, str]] = {}
         # Pessimistic defaults: anything that doesn't reach a known end
         # (generator torn down by a client disconnect) counts as interrupted.
         self.outcome = "interrupted"            # complete | interrupted | error
@@ -382,10 +468,34 @@ class _TurnRecord:
         name = getattr(event, "tool_name", "") or "tool"
         # Autocompaction is reported as a ToolStatusEvent but is not a tool
         # the model ran — keep it out of the ledger/tool_calls count.
-        if name == "autocompact":
+        if name in _NON_TOOL_STATUS_NAMES:
+            return
+        call_id = str(getattr(event, "tool_call_id", "") or "")
+        if status in ("started", "progress"):
+            # "progress" is just "still running": never a completion, never a
+            # second ledger entry. Remember the call so a cut-off turn can say
+            # what was in flight.
+            if call_id and call_id not in self._counted_calls and call_id not in self._running_calls:
+                detail = str(getattr(event, "detail", "") or "")[:80]
+                self._running_calls[call_id] = (name, detail)
             return
         if status in ("completed", "failed"):
+            if call_id:
+                self._running_calls.pop(call_id, None)
+                if call_id in self._counted_calls:
+                    return
+                self._counted_calls.add(call_id)
             self.tools.append((name, status == "completed"))
+
+    def in_flight_summary(self) -> str:
+        """Tool calls still running when the turn ended, as "name (detail), ..."."""
+        parts: List[str] = []
+        for name, detail in list(self._running_calls.values())[:5]:
+            parts.append(f"{name} ({detail})" if detail else name)
+        extra = len(self._running_calls) - 5
+        if extra > 0:
+            parts.append(f"+{extra} more")
+        return ", ".join(parts)
 
     def mark_complete(self, finish_reason: str) -> None:
         """Record a run that ended without raising.
@@ -446,6 +556,11 @@ class _TurnRecord:
             marker += f" Tools run this turn: {ledger}."
         else:
             marker += " No tools completed this turn."
+        in_flight = self.in_flight_summary()
+        if in_flight:
+            marker += (
+                f" Still running when it was cut off (may have partly executed): {in_flight}."
+            )
         if text.strip():
             return text.rstrip() + "\n\n" + marker
         return marker
@@ -684,6 +799,9 @@ async def chat_completions(
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         created_timestamp = int(time.time())
         record = _TurnRecord()
+        # Monotonic start of this turn (after the lease): a stop requested at or
+        # after it was aimed at this turn.
+        turn_started_at = time.monotonic()
         response_headers: Dict[str, str] = (
             {"X-Session-Id": public_session_id} if public_session_id else {}
         )
@@ -697,6 +815,15 @@ async def chat_completions(
             if record.persisted:
                 return
             record.persisted = True
+            if (
+                record.outcome == "interrupted"
+                and record.reason == "client disconnected"
+                and session_stop_requested_since(session_id, turn_started_at)
+            ):
+                # The stream was torn down because a stop was requested (e.g. a
+                # newer message preempted this turn), not because the client
+                # simply vanished - say so in the history marker.
+                record.reason = "stopped by user request"
             text = record.assistant_text
             print(
                 f"[CHAT] turn end session={session_id} outcome={record.outcome} "
@@ -782,16 +909,10 @@ async def chat_completions(
                             yield _sse(_chunk_payload(chunk, public_session_id))
                         elif isinstance(event, ToolStatusEvent):
                             record.note_tool_status(event)
-                            tool_data = json.dumps({
-                                "tool_status": {
-                                    "tool_name": event.tool_name,
-                                    "tool_call_id": event.tool_call_id,
-                                    "status": event.status,
-                                    "duration": event.duration,
-                                    "activity": event.activity,
-                                    "user_name": event.user_name,
-                                }
-                            })
+                            tool_data = json.dumps(
+                                {"tool_status": _tool_status_payload(event)},
+                                default=str,
+                            )
                             # Named event — standard clients ignore unknown event types
                             yield {"event": "tool_status", "data": tool_data}
 

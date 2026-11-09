@@ -428,6 +428,11 @@ class SubAgentTool:
                     if isinstance(event, TextEvent):
                         state.add_text(event.content or "")
                     elif isinstance(event, ToolStatusEvent):
+                        if (event.status or "") == "progress":
+                            # Periodic liveness tick of a still-running child tool:
+                            # not new activity, so it must not split the answer text
+                            # or inflate the tool-event ledger.
+                            continue
                         # Any tool activity closes the current text segment, so
                         # the text after the last tool event is the final answer.
                         state.boundary()

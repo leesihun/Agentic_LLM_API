@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import json as _json
 import re
+import time
 import uuid
 from collections import deque
 from pathlib import Path
@@ -17,6 +18,7 @@ from backend.utils.stop_signal import check_stop, StopInferenceError
 from tools.schemas import TOOL_METADATA
 
 from backend.agent._cache import _CACHED_GOAL_MODE_PROMPT
+from backend.agent import watchdog as _wd
 from backend.agent.logging_helpers import LoggingMixin
 from backend.agent.prompt_assembly import PromptMixin
 from backend.agent.tool_dispatch import DispatchMixin, _format_exception
@@ -58,6 +60,9 @@ _LOOP_NUDGES = frozenset({
     _REISSUE_TOOL_NUDGE,
     _FINAL_ANSWER_NUDGE,
 })
+# Injected by the turn review (supervisor) at an iteration boundary. Matched by
+# prefix in _is_loop_nudge so it is never mistaken for the user's request.
+_SUPERVISOR_NUDGE_PREFIX = "Supervisor check after"
 _LENGTH_NOTICE = "\n\n[출력이 길이 제한으로 잘렸습니다]"
 _STREAM_ERROR_NOTICE = "\n\n[응답 생성 중 연결 오류로 출력이 중단되었습니다]"
 _TOOL_DROPPED_NOTICE = "\n\n[반복 한도에 도달하여 추가 도구 호출은 실행하지 않았습니다]"
@@ -295,6 +300,17 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
         # and forwarded to this stream while a tool group is awaited.
         self._child_progress: Deque[ToolStatusEvent] = deque(maxlen=64)
         self._child_progress_signal: Optional[asyncio.Event] = None
+        # Live-visibility / supervisor state (reset per run in _reset_run_state).
+        self._tool_launch_times: Dict[str, float] = {}
+        self._completion_emitted: set = set()  # call ids whose terminal event is out
+        self._agent_child_sessions: Dict[str, str] = {}
+        self._msgs_ref: Optional[List[Dict[str, Any]]] = None
+        self._turn_started: float = time.monotonic()
+        self._last_touch: float = 0.0
+        self._last_review_at: Optional[float] = None
+        self._last_review_iter: int = 0
+        self._supervisor_reviews: int = 0
+        self._watchdog_stops: int = 0
 
     # ------------------------------------------------------------------
     # Sampling parameters forwarded to vLLM
@@ -569,6 +585,7 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
         return (
             stripped.endswith(_FINAL_ANSWER_NUDGE)
             or stripped.startswith("<internal_notes>")
+            or stripped.startswith(_SUPERVISOR_NUDGE_PREFIX)
         )
 
     @staticmethod
@@ -776,6 +793,8 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
             "tool_calls": getattr(self, "_tool_calls_dispatched", 0),
             "compactions": getattr(self, "_compactions", 0),
             "fallback_used": bool(getattr(self, "_fallback_used", False)),
+            "supervisor_reviews": getattr(self, "_supervisor_reviews", 0),
+            "watchdog_stops": getattr(self, "_watchdog_stops", 0),
         }
 
     def _reset_run_state(self) -> None:
@@ -793,7 +812,30 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
         self._final_answer_text = ""
         self._final_answer_cut = None
         self.final_finish_reason = None
+        self._tool_launch_times = {}
+        self._completion_emitted = set()
+        self._agent_child_sessions = {}
+        self._msgs_ref = None
+        self._turn_started = time.monotonic()
+        self._last_touch = 0.0
+        self._last_review_at = None
+        self._last_review_iter = 0
+        self._supervisor_reviews = 0
+        self._watchdog_stops = 0
         self.diagnostics = self._build_diagnostics(None)
+
+    def _touch_turn(self, **fields: Any) -> None:
+        """Refresh this session's turn record in the watchdog registry. Bare
+        activity pings (no fields) are throttled to ~1/s so streaming deltas stay
+        cheap; state/iteration changes always go through."""
+        try:
+            now = time.monotonic()
+            if not fields and now - self._last_touch < 1.0:
+                return
+            self._last_touch = now
+            _wd.note_turn(self.session_id, **fields)
+        except Exception:
+            pass
 
     async def run_stream(
         self,
@@ -807,6 +849,7 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
         After the run, `self.final_finish_reason` is one of "stop" | "length" |
         "error" | "interrupted" and `self.diagnostics` holds the C7 dict."""
         self._reset_run_state()
+        self._touch_turn(iteration=0, state="llm")
         body = self._run_stream_body(messages, attached_files)
         try:
             async for event in body:
@@ -834,6 +877,8 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
                     pass
                 await self._reap_inflight_tasks()
             finally:
+                _wd.clear_turn(self.session_id)
+                self._msgs_ref = None
                 if not self.final_finish_reason:
                     self.final_finish_reason = "interrupted"
                 self.diagnostics = self._build_diagnostics(self.final_finish_reason)
@@ -855,6 +900,7 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
 
     def _launch_tool(self, tc: ToolCall) -> asyncio.Task:
         """create_task(_safe_execute) tracked in _inflight_tasks until done."""
+        self._tool_launch_times[tc.id] = time.monotonic()
         task = asyncio.create_task(self._safe_execute(tc))
         self._inflight_tasks.add(task)
         task.add_done_callback(self._inflight_tasks.discard)
@@ -885,17 +931,73 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
         except Exception:
             pass
 
-    async def _await_with_progress(self, tasks: List[asyncio.Task]) -> AsyncIterator[StreamEvent]:
-        """Wait for *tasks* to finish, yielding queued subagent progress
-        events meanwhile (results are read from the tasks afterwards)."""
+    def _started_event(self, tc: ToolCall) -> ToolStatusEvent:
+        meta = TOOL_METADATA.get(tc.function.name, {})
+        try:
+            detail = _wd.describe_call(tc.function.name, tc.function.arguments)
+        except Exception:
+            detail = ""
+        return ToolStatusEvent(
+            tool_name=tc.function.name,
+            tool_call_id=tc.id,
+            status="started",
+            activity=meta.get("activity", ""),
+            user_name=meta.get("user_name", ""),
+            detail=detail,
+        )
+
+    async def _await_with_progress(
+        self, calls: List[Tuple[ToolCall, asyncio.Task]],
+    ) -> AsyncIterator[StreamEvent]:
+        """Wait for the tool tasks of *calls* to finish while yielding (a) queued
+        subagent progress events and (b) a status="progress" event per still-running
+        tool after TOOL_PROGRESS_AFTER_SECONDS, then every
+        TOOL_PROGRESS_INTERVAL_SECONDS. Results are read from the tasks afterwards.
+
+        Idle cost is one asyncio.wait with a timeout (no polling); it never delays
+        a result because it wakes on task completion."""
         if self._child_progress_signal is None:
             self._child_progress_signal = asyncio.Event()
         signal = self._child_progress_signal
-        pending = {t for t in tasks if not t.done()}
+        after = max(0.5, float(getattr(config, "TOOL_PROGRESS_AFTER_SECONDS", 6)))
+        interval = max(1.0, float(getattr(config, "TOOL_PROGRESS_INTERVAL_SECONDS", 10)))
+        now = time.monotonic()
+        next_tick: Dict[str, float] = {}
+        for tc, _t in calls:
+            next_tick[tc.id] = self._tool_launch_times.get(tc.id, now) + after
+        emitted = self._completion_emitted
+
+        def _finished_events() -> List[ToolStatusEvent]:
+            # "completed"/"failed" as each task finishes (not after the whole
+            # iteration), so a turn cut off mid-iteration (stop / preempt) still
+            # has accurate per-call status for the tools that already ended.
+            out: List[ToolStatusEvent] = []
+            for f_tc, f_t in calls:
+                if not f_t.done() or f_tc.id in emitted:
+                    continue
+                emitted.add(f_tc.id)
+                try:
+                    out.append(self._completion_event(
+                        f_tc, self._coerce_tool_result(self._task_outcome(f_t)),
+                    ))
+                except Exception:
+                    pass
+            return out
+
+        pending = {t for _tc, t in calls if not t.done()}
+        for ev in _finished_events():
+            yield ev
         while pending:
+            running_ids = [tc.id for tc, t in calls if not t.done()]
+            now = time.monotonic()
+            due = min((next_tick[i] for i in running_ids), default=now + interval)
             waiter = asyncio.ensure_future(signal.wait())
             try:
-                await asyncio.wait(pending | {waiter}, return_when=asyncio.FIRST_COMPLETED)
+                await asyncio.wait(
+                    pending | {waiter},
+                    timeout=max(0.05, due - now),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
             finally:
                 if not waiter.done():
                     waiter.cancel()
@@ -903,7 +1005,157 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
             signal.clear()
             while self._child_progress:
                 yield self._child_progress.popleft()
+            for ev in _finished_events():
+                yield ev
+            now = time.monotonic()
+            for tc, t in calls:
+                if not t.done() and now >= next_tick[tc.id]:
+                    next_tick[tc.id] = now + interval
+                    try:
+                        yield self._make_progress_event(tc)
+                    except Exception:
+                        pass
         self._child_progress.clear()
+
+    def _completion_event(self, tc: ToolCall, result: Dict[str, Any]) -> ToolStatusEvent:
+        """The terminal "completed"/"failed" ToolStatusEvent of one tool call."""
+        duration = 0.0
+        for e in reversed(self.tool_calls_log):
+            if e.get("tool_call_id") == tc.id:
+                duration = e.get("duration", 0) or 0
+                break
+        status = "completed" if result.get("success", True) else "failed"
+        meta = TOOL_METADATA.get(tc.function.name, {})
+        launch_ts = self._tool_launch_times.get(tc.id)
+        stopped = result.get("stopped_reason")
+        if stopped:
+            status = "failed"
+            detail = f"stopped: {stopped}"
+        else:
+            try:
+                detail = _wd.describe_call(tc.function.name, tc.function.arguments)
+            except Exception:
+                detail = ""
+        elapsed = float(duration) if duration else (
+            max(0.0, time.monotonic() - launch_ts) if launch_ts is not None else 0.0
+        )
+        return ToolStatusEvent(
+            tool_name=tc.function.name,
+            tool_call_id=tc.id,
+            status=status,
+            duration=round(float(duration), 2),
+            activity=meta.get("activity", ""),
+            user_name=meta.get("user_name", ""),
+            detail=detail,
+            elapsed=round(elapsed, 2),
+        )
+
+    # ------------------------------------------------------------------
+    # Turn review (iteration-boundary supervisor for very long jobs)
+    # ------------------------------------------------------------------
+
+    def _turn_review_due(self, iteration: int) -> bool:
+        if not getattr(config, "TURN_REVIEW_ENABLED", True) or iteration <= 0:
+            return False
+        if "__sub_" in (self.session_id or ""):
+            return False  # subagents are bounded by their own deadline
+        now = time.monotonic()
+        after = max(1.0, float(getattr(config, "TURN_REVIEW_AFTER_SECONDS", 900)))
+        if now - self._turn_started < after:
+            return False
+        if self._last_review_at is None:
+            return True
+        interval = max(1.0, float(getattr(config, "TURN_REVIEW_INTERVAL_SECONDS", 900)))
+        every = int(getattr(config, "TURN_REVIEW_EVERY_ITERATIONS", 40) or 0)
+        return (
+            now - self._last_review_at >= interval
+            or (every > 0 and iteration - self._last_review_iter >= every)
+        )
+
+    def _build_turn_review_prompt(self, elapsed: float, iteration: int) -> str:
+        lines = [
+            f"User request (headline): {_wd.mask_text(self._request_headline(400)) or '(unknown)'}",
+            f"Running for: {_wd.fmt_duration(elapsed)}; LLM iterations so far: {iteration}",
+        ]
+        log = list(self._worklog or [])
+        if log:
+            counts: Dict[str, int] = {}
+            failed = 0
+            for e in log:
+                counts[e["name"]] = counts.get(e["name"], 0) + 1
+                if not e.get("success", True):
+                    failed += 1
+            ledger = ", ".join(
+                f"{n} x{c}" for n, c in sorted(counts.items(), key=lambda kv: -kv[1])[:10]
+            )
+            lines.append(f"Tool calls so far: {len(log)} (failed {failed}): {ledger}")
+            lines.append("Last tool results:")
+            for e in log[-5:]:
+                head = _wd.mask_text((e.get("headline") or "")[:120])
+                lines.append(f"- {e['name']} ({'ok' if e.get('success', True) else 'failed'}): {head}")
+        else:
+            lines.append("Tool calls so far: none")
+        todos = self._session_todos or []
+        if todos:
+            done = sum(1 for t in todos if t.get("status") == "completed")
+            lines.append(f"Todo list: {done}/{len(todos)} completed")
+            for t in [t for t in todos if t.get("status") != "completed"][:5]:
+                lines.append(f"- [{t.get('status', 'pending')}] {str(t.get('content', ''))[:100]}")
+        else:
+            lines.append("Todo list: none")
+        lines.append("Judge whether the agent is on track. Answer with the JSON object only.")
+        return "\n".join(lines)
+
+    async def _review_turn(
+        self, msgs: List[Dict[str, Any]], iteration: int,
+    ) -> AsyncIterator[StreamEvent]:
+        """Supervisor check of a long-running turn at an iteration boundary.
+        continue -> nothing; replan / wrap_up -> a non-persisted user-role nudge
+        is appended to *msgs* (before the next LLM call) and a visible
+        ToolStatusEvent is yielded. Fails open on every error."""
+        if not self._turn_review_due(iteration):
+            return
+        now = time.monotonic()
+        self._last_review_at = now
+        self._last_review_iter = iteration
+        elapsed = now - self._turn_started
+        self._touch_turn(state="review")
+        reply = await self._supervisor_llm_text(
+            _wd.TURN_REVIEW_SYSTEM,
+            self._build_turn_review_prompt(elapsed, iteration),
+            "agent:turn_review",
+        )
+        self._touch_turn(state="llm")
+        self._supervisor_reviews += 1
+        verdict, note = _wd.parse_turn_verdict(reply)
+        if verdict == "wrap_up" and self.goal_mode and self._goal_gate_would_block():
+            verdict = "continue"  # the done-gate owns completion in goal mode
+        self._log(f"[TURN_REVIEW] after {_wd.fmt_duration(elapsed)} / iteration {iteration}: "
+                  f"{verdict} {note[:200]}")
+        if verdict == "continue":
+            return
+        minutes = max(1, int(round(elapsed / 60.0)))
+        if verdict == "wrap_up":
+            guidance = ("Deliver what you have now and state clearly what remains "
+                        "to be done.")
+        elif "agent" in (getattr(self, "_enabled_tool_names", None) or ()):
+            guidance = ("Narrow the plan, or delegate independent parts to parallel "
+                        "subagents with the agent tool.")
+        else:
+            guidance = "Narrow the plan and focus on the most important remaining work."
+        if note and note[-1] not in ".!?。…":
+            note_txt = note + ". "
+        else:
+            note_txt = note + " " if note else ""
+        text = f"{_SUPERVISOR_NUDGE_PREFIX} {minutes} min: {note_txt}{guidance}"
+        msgs.append({"role": "user", "content": text})
+        yield ToolStatusEvent(
+            tool_name="supervisor",
+            tool_call_id=f"supervisor_{iteration}",
+            status="completed",
+            activity=f"진행 점검: {verdict}",
+            detail=note,
+        )
 
     @staticmethod
     def _task_outcome(task: asyncio.Task) -> Any:
@@ -1103,6 +1355,7 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
         yielded and self._final_answer_cut is set ("length" / "error") for the
         caller's finish_reason.
         """
+        self._touch_turn(state="final")
         self._recovered_tool_calls = []
         self._final_answer_text = ""
         self._final_answer_cut = None
@@ -1256,6 +1509,7 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
         self._own_system_count = len(msgs)
         msgs.extend(messages)
         self._enforce_history_limit(msgs)
+        self._msgs_ref = msgs
         tool_schemas = self._get_tool_schemas()
         self._enabled_tool_names = {
             s["function"]["name"] for s in (tool_schemas or [])
@@ -1270,10 +1524,13 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
         for iteration in range(self.max_iterations):
             check_stop(self.session_id)
             self._iterations_run = iteration + 1
+            self._touch_turn(iteration=iteration + 1, state="llm")
             print(f"\n[AGENT-STREAM] Iteration {iteration + 1}/{self.max_iterations}")
             self._log_iteration_start(iteration, streaming=True)
 
             self._iteration_boundaries.append(len(msgs))
+            async for _review_ev in self._review_turn(msgs, iteration):
+                yield _review_ev
 
             # Collect all tool calls. Concurrency-safe tools (independent reads
             # and subagent fan-out) run in parallel during resolution; mutating
@@ -1311,6 +1568,7 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
                     agent_type="agent:stream",
                     **self._sampling_kwargs(final_response=True),
                 ):
+                    self._touch_turn()
                     if isinstance(event, TextEvent):
                         streamed_text_parts.append(event.content)
                         if hold_text and not all_tool_calls:
@@ -1340,15 +1598,8 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
                             elif not has_parse_error:
                                 deferred_seen = True
                             pending_tasks.append((tc, task))
-                            _meta = TOOL_METADATA.get(tc.function.name, {})
                             if task is not None:
-                                yield ToolStatusEvent(
-                                    tool_name=tc.function.name,
-                                    tool_call_id=tc.id,
-                                    status="started",
-                                    activity=_meta.get("activity", ""),
-                                    user_name=_meta.get("user_name", ""),
-                                )
+                                yield self._started_event(tc)
             except BaseException as e:
                 saw_output = bool(streamed_text_parts or streamed_reasoning_parts or all_tool_calls)
                 if (
@@ -1586,6 +1837,7 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
             # gather(return_exceptions=True): one tool blowing up becomes an error
             # result for that call only. On cancellation / stop / generator close
             # every launched task is cancelled before re-raising.
+            self._touch_turn(state="tools")
             n_pending = len(pending_tasks)
             results: List[Optional[Dict[str, Any]]] = [None] * n_pending
             launched: List[asyncio.Task] = [t for _, t in pending_tasks if t is not None]
@@ -1596,6 +1848,7 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
                     if meta.get("is_concurrency_safe"):
                         group_idx: List[int] = []
                         group_tasks: List[asyncio.Task] = []
+                        group_calls: List[Tuple[ToolCall, asyncio.Task]] = []
                         while idx < n_pending:
                             g_tc, g_task = pending_tasks[idx]
                             g_meta = TOOL_METADATA.get(g_tc.function.name, {})
@@ -1605,41 +1858,36 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
                                 # Not started mid-stream — launch now and announce it.
                                 g_task = self._launch_tool(g_tc)
                                 launched.append(g_task)
-                                yield ToolStatusEvent(
-                                    tool_name=g_tc.function.name,
-                                    tool_call_id=g_tc.id,
-                                    status="started",
-                                    activity=g_meta.get("activity", ""),
-                                    user_name=g_meta.get("user_name", ""),
-                                )
+                                yield self._started_event(g_tc)
                             group_tasks.append(g_task)
+                            group_calls.append((g_tc, g_task))
                             group_idx.append(idx)
                             idx += 1
-                        if any(pending_tasks[i][0].function.name == "agent" for i in group_idx):
-                            # Subagents run for minutes: forward their progress
-                            # (child tool starts) while waiting.
-                            progress = self._await_with_progress(group_tasks)
-                            try:
-                                async for ev in progress:
-                                    yield ev
-                            finally:
-                                await progress.aclose()
-                            group_results = [self._task_outcome(t) for t in group_tasks]
-                        else:
-                            group_results = await asyncio.gather(*group_tasks, return_exceptions=True)
+                        # Every group is awaited with a ticker: subagent progress
+                        # (child tool starts) and per-tool "progress" events are
+                        # forwarded while waiting; results are read afterwards.
+                        progress = self._await_with_progress(group_calls)
+                        try:
+                            async for ev in progress:
+                                yield ev
+                        finally:
+                            await progress.aclose()
+                        group_results = [self._task_outcome(t) for t in group_tasks]
                         for r_idx, r in zip(group_idx, group_results):
                             results[r_idx] = self._coerce_tool_result(r)
                     else:
                         # Serial barrier: mutating / stateful tool runs alone.
                         tc, _ = pending_tasks[idx]
-                        yield ToolStatusEvent(
-                            tool_name=tc.function.name,
-                            tool_call_id=tc.id,
-                            status="started",
-                            activity=meta.get("activity", ""),
-                            user_name=meta.get("user_name", ""),
-                        )
-                        results[idx] = self._coerce_tool_result(await self._safe_execute(tc))
+                        yield self._started_event(tc)
+                        s_task = self._launch_tool(tc)
+                        launched.append(s_task)
+                        progress = self._await_with_progress([(tc, s_task)])
+                        try:
+                            async for ev in progress:
+                                yield ev
+                        finally:
+                            await progress.aclose()
+                        results[idx] = self._coerce_tool_result(self._task_outcome(s_task))
                         idx += 1
             except BaseException:
                 self._cancel_tasks(launched)
@@ -1649,6 +1897,7 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
             # Record iteration outcome (all-failed vs at-least-one-success)
             # for the consecutive-failure detector.
             self._record_iteration_outcome(results)
+            self._touch_turn(state="llm")
 
             # Carry post-edit check failures into next iteration as a high-priority
             # system-reminder so the model must address them before continuing.
@@ -1680,17 +1929,13 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
 
             # Emit "completed"/"failed" events and append results
             for tc, result in zip(all_tool_calls, results):
-                duration = duration_by_call_id.get(tc.id, 0) or 0
-                status = "completed" if result.get("success", True) else "failed"
-                _meta = TOOL_METADATA.get(tc.function.name, {})
-                yield ToolStatusEvent(
-                    tool_name=tc.function.name,
-                    tool_call_id=tc.id,
-                    status=status,
-                    duration=round(float(duration), 2),
-                    activity=_meta.get("activity", ""),
-                    user_name=_meta.get("user_name", ""),
-                )
+                if tc.id in self._completion_emitted:
+                    # Already announced the moment the task finished
+                    # (_await_with_progress); never emit a duplicate.
+                    self._completion_emitted.discard(tc.id)
+                else:
+                    yield self._completion_event(tc, result)
+                self._tool_launch_times.pop(tc.id, None)
                 msgs.append(self._build_tool_result_msg(tc, result))
                 try:
                     self._record_worklog(tc, result)
@@ -1727,6 +1972,7 @@ class AgentLoop(LoggingMixin, CompactionMixin, DispatchMixin, FormattingMixin, P
         print(f"[AGENT-STREAM] Max iterations ({self.max_iterations}) reached, requesting final answer")
         self._log_agent_complete(f"Max iterations ({self.max_iterations}) reached (stream)", self.max_iterations)
         check_stop(self.session_id)
+        self._touch_turn(state="final")
         msgs.append({"role": "system", "content": _TOOLS_UNAVAILABLE_NUDGE})
         final_text_parts: List[str] = []
         final_reason_parts: List[str] = []
